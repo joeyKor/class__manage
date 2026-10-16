@@ -13,6 +13,16 @@
         {
             "date": "2026-04-29 23:18",
             "content": "l 테두리\nc 컬러 작성\nh 높이\nw 너비"
+        },
+        {
+            "date": "2026-10-13 07:26",
+            "content": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0//EN\" \"http://www.w3.org/TR/REC-html40/strict.dtd\">\n<html><head><meta name=\"qrichtext\" content=\"1\" /><style type=\"text/css\">\np, li { white-space: pre-wrap; }\n</style></head><body style=\" font-family:'Malgun Gothic'; font-size:13pt; font-weight:400; font-style:normal;\">\n<p style=\" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\"><img src=\"e:/PythonWork/member_lookup_app/log_images/log_img_20261013_072651_998641.png\" width=\"460\" />SDS</p>\n<p style=\"-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\"><br /></p></body></html>"
+        }
+    ],
+    "3학년 1반": [
+        {
+            "date": "2026-10-13 07:30",
+            "content": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0//EN\" \"http://www.w3.org/TR/REC-html40/strict.dtd\">\n<html><head><meta name=\"qrichtext\" content=\"1\" /><style type=\"text/css\">\np, li { white-space: pre-wrap; }\n</style></head><body style=\" font-family:'Malgun Gothic'; font-size:13pt; font-weight:400; font-style:normal;\">\n<p style=\" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\"><img src=\"e:/PythonWork/member_lookup_app/log_images/log_img_20261013_073048_357190.png\" width=\"460\" />바이브 코딩</p></body></html>"
         }
     ]
 }

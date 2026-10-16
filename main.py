@@ -5,8 +5,9 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QFrame, QGraphicsDropShadowEffect,
                              QListWidget, QListWidgetItem, QPushButton, QComboBox, QDialog, QTextEdit, QMessageBox, QScrollArea, QMenu, QInputDialog, QGridLayout,
-                             QTableWidget, QTableWidgetItem, QHeaderView)
-from PyQt5.QtGui import QPixmap, QFont, QColor, QKeyEvent, QCursor, QPainter, QPen, QBrush, QPainterPath
+                             QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QColorDialog, QToolButton)
+from PyQt5.QtGui import (QPixmap, QFont, QColor, QKeyEvent, QCursor, QPainter, QPen, QBrush, QPainterPath,
+                         QImage, QTextCursor, QTextCharFormat, QTextBlockFormat, QTextListFormat)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QUrl, QPropertyAnimation, QEasingCurve, QRect, QRectF, QSize, QEvent, QPointF
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from collections import Counter
@@ -176,51 +177,454 @@ class MiniTimerWindow(QWidget):
             self.parent_app.raise_()
             self.parent_app.id_input.setFocus()
 
-class LogWriteDialog(QDialog):
-    def __init__(self, class_name, parent=None):
+class RichTextEdit(QTextEdit):
+    def __init__(self, base_dir, parent=None):
         super().__init__(parent)
+        self.base_dir = base_dir
+        self.setAcceptRichText(True)
+        self.setPlaceholderText("오늘의 수업 내용, 활동 사진, 학생 피드백 등을 자유롭게 기록하세요...\n(💡 캡처 도구로 캡처한 이미지를 Ctrl+V로 바로 붙여넣거나, 사진 파일을 드래그하여 넣을 수 있습니다)")
+
+    def canInsertFromMimeData(self, source):
+        if source.hasImage() or source.hasUrls():
+            return True
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source):
+        if source.hasImage():
+            image = source.imageData()
+            if isinstance(image, QImage) and not image.isNull():
+                self.insert_qimage(image)
+                return
+            elif isinstance(image, QPixmap) and not image.isNull():
+                self.insert_qimage(image.toImage())
+                return
+        elif source.hasUrls():
+            for url in source.urls():
+                local_path = url.toLocalFile()
+                if local_path and local_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')):
+                    img = QImage(local_path)
+                    if not img.isNull():
+                        self.insert_qimage(img, orig_ext=os.path.splitext(local_path)[1])
+                        return
+        super().insertFromMimeData(source)
+
+    def insert_qimage(self, image, orig_ext=".png"):
+        img_dir = os.path.join(self.base_dir, 'log_images')
+        os.makedirs(img_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        ext = orig_ext if orig_ext.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.webp'] else '.png'
+        filename = f"log_img_{timestamp}{ext}"
+        saved_path = os.path.abspath(os.path.join(img_dir, filename)).replace('\\', '/')
+        
+        fmt = "PNG" if ext == ".png" else "JPEG"
+        image.save(saved_path, fmt)
+
+        disp_width = min(image.width(), 460)
+        cursor = self.textCursor()
+        cursor.insertHtml(f'<p><img src="{saved_path}" width="{disp_width}" style="max-width:100%; border-radius:8px; margin:6px 0;"></p><p></p>')
+        self.ensureCursorVisible()
+
+    def insert_image_from_file(self, file_path):
+        if not file_path or not os.path.exists(file_path):
+            return
+        img = QImage(file_path)
+        if not img.isNull():
+            ext = os.path.splitext(file_path)[1]
+            self.insert_qimage(img, orig_ext=ext)
+
+class LogWriteDialog(QDialog):
+    def __init__(self, class_name, parent=None, initial_content=""):
+        if isinstance(parent, str):
+            actual_content = parent
+            actual_parent = initial_content if isinstance(initial_content, QWidget) else None
+        else:
+            actual_parent = parent if isinstance(parent, QWidget) else None
+            actual_content = initial_content if isinstance(initial_content, str) else ""
+
+        super().__init__(actual_parent)
         self.class_name = class_name
+        self.initial_content = actual_content
         self.result_text = ""
+        self.base_dir = getattr(actual_parent, "base_dir", os.path.dirname(os.path.abspath(__file__)))
+        self.current_text_color = QColor("#1E293B")
         self.initUI()
         
     def initUI(self):
-        self.setWindowTitle(f'{self.class_name} 수업 일지 작성')
-        self.resize(500, 400)
-        self.setStyleSheet("background-color: white;")
+        is_edit_mode = bool(self.initial_content.strip())
+        self.setWindowTitle(f'{self.class_name} 수업 일지 {"수정" if is_edit_mode else "작성"}')
+        self.resize(750, 680)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #F8FAFC;
+            }
+        """)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
         
-        title = QLabel(f'[{self.class_name}] 오늘 수업 내용')
-        title.setFont(QFont('Malgun Gothic', 14, QFont.Bold))
-        layout.addWidget(title)
+        # Header
+        header_layout = QHBoxLayout()
+        title_icon = QLabel("📝")
+        title_icon.setFont(QFont('Segoe UI Emoji', 18))
+        header_layout.addWidget(title_icon)
         
-        self.text_edit = QTextEdit()
-        self.text_edit.setFont(QFont('Malgun Gothic', 12))
-        self.text_edit.setStyleSheet("border: 2px solid #E2E8F0; border-radius: 8px; padding: 10px;")
+        title = QLabel(f'[{self.class_name}] 오늘 수업 기록 {"수정" if is_edit_mode else "작성"}')
+        title.setFont(QFont('Malgun Gothic', 15, QFont.Bold))
+        title.setStyleSheet("color: #1E293B;")
+        header_layout.addWidget(title)
+        
+        date_badge = QLabel(datetime.now().strftime('%Y년 %m월 %d일'))
+        date_badge.setFont(QFont('Malgun Gothic', 10, QFont.Bold))
+        date_badge.setStyleSheet("color: #3B82F6; background-color: #EFF6FF; border: 1px solid #DBEAFE; border-radius: 6px; padding: 4px 10px;")
+        header_layout.addWidget(date_badge, alignment=Qt.AlignRight)
+        layout.addLayout(header_layout)
+        
+        # Toolbar Container
+        toolbar_frame = QFrame()
+        toolbar_frame.setStyleSheet("""
+            QFrame {
+                background-color: white;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 4px;
+            }
+        """)
+        toolbar_layout = QHBoxLayout(toolbar_frame)
+        toolbar_layout.setContentsMargins(6, 6, 6, 6)
+        toolbar_layout.setSpacing(6)
+        
+        btn_style = """
+            QPushButton {
+                background-color: #F1F5F9;
+                color: #334155;
+                border: 1px solid #CBD5E1;
+                border-radius: 5px;
+                font-family: 'Malgun Gothic';
+                font-size: 12px;
+                font-weight: bold;
+                padding: 4px 8px;
+                min-height: 26px;
+            }
+            QPushButton:hover {
+                background-color: #E2E8F0;
+                border-color: #94A3B8;
+            }
+            QPushButton:checked {
+                background-color: #3B82F6;
+                color: white;
+                border-color: #2563EB;
+            }
+        """
+        
+        # Bold, Italic, Underline, Strikeout
+        self.btn_bold = QPushButton("B")
+        self.btn_bold.setCheckable(True)
+        self.btn_bold.setFixedWidth(32)
+        self.btn_bold.setFont(QFont('Arial', 12, QFont.Bold))
+        self.btn_bold.setStyleSheet(btn_style)
+        self.btn_bold.setToolTip("굵게 (Ctrl+B)")
+        self.btn_bold.clicked.connect(self.toggle_bold)
+        toolbar_layout.addWidget(self.btn_bold)
+        
+        self.btn_italic = QPushButton("I")
+        self.btn_italic.setCheckable(True)
+        self.btn_italic.setFixedWidth(32)
+        self.btn_italic.setFont(QFont('Arial', 12, QFont.Normal, True))
+        self.btn_italic.setStyleSheet(btn_style)
+        self.btn_italic.setToolTip("기울임 (Ctrl+I)")
+        self.btn_italic.clicked.connect(self.toggle_italic)
+        toolbar_layout.addWidget(self.btn_italic)
+        
+        self.btn_underline = QPushButton("U")
+        self.btn_underline.setCheckable(True)
+        self.btn_underline.setFixedWidth(32)
+        f_u = QFont('Arial', 11)
+        f_u.setUnderline(True)
+        self.btn_underline.setFont(f_u)
+        self.btn_underline.setStyleSheet(btn_style)
+        self.btn_underline.setToolTip("밑줄 (Ctrl+U)")
+        self.btn_underline.clicked.connect(self.toggle_underline)
+        toolbar_layout.addWidget(self.btn_underline)
+        
+        self.btn_strike = QPushButton("S")
+        self.btn_strike.setCheckable(True)
+        self.btn_strike.setFixedWidth(32)
+        f_s = QFont('Arial', 11)
+        f_s.setStrikeOut(True)
+        self.btn_strike.setFont(f_s)
+        self.btn_strike.setStyleSheet(btn_style)
+        self.btn_strike.setToolTip("취소선")
+        self.btn_strike.clicked.connect(self.toggle_strike)
+        toolbar_layout.addWidget(self.btn_strike)
+        
+        # Separator line
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.VLine)
+        sep1.setStyleSheet("color: #E2E8F0;")
+        toolbar_layout.addWidget(sep1)
+        
+        # Font size combo
+        self.size_combo = QComboBox()
+        self.size_combo.addItems(["10pt", "12pt", "13pt", "15pt", "18pt", "22pt", "26pt"])
+        self.size_combo.setCurrentText("13pt")
+        self.size_combo.setFixedHeight(30)
+        self.size_combo.setStyleSheet("""
+            QComboBox {
+                border: 1px solid #CBD5E1;
+                border-radius: 5px;
+                padding: 2px 8px;
+                background-color: #F8FAFC;
+                font-family: 'Malgun Gothic';
+                font-size: 11px;
+                font-weight: bold;
+                color: #334155;
+            }
+        """)
+        self.size_combo.currentTextChanged.connect(self.change_font_size)
+        toolbar_layout.addWidget(self.size_combo)
+        
+        # Color picker button
+        self.btn_color = QPushButton("🎨 글자색")
+        self.btn_color.setStyleSheet(btn_style)
+        self.btn_color.setToolTip("글자 색상 선택")
+        self.btn_color.clicked.connect(self.choose_text_color)
+        toolbar_layout.addWidget(self.btn_color)
+        
+        # Separator line
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.VLine)
+        sep2.setStyleSheet("color: #E2E8F0;")
+        toolbar_layout.addWidget(sep2)
+        
+        # Alignment buttons
+        self.btn_align_left = QPushButton("좌측")
+        self.btn_align_left.setStyleSheet(btn_style)
+        self.btn_align_left.clicked.connect(lambda: self.text_edit.setAlignment(Qt.AlignLeft))
+        toolbar_layout.addWidget(self.btn_align_left)
+        
+        self.btn_align_center = QPushButton("중앙")
+        self.btn_align_center.setStyleSheet(btn_style)
+        self.btn_align_center.clicked.connect(lambda: self.text_edit.setAlignment(Qt.AlignCenter))
+        toolbar_layout.addWidget(self.btn_align_center)
+        
+        self.btn_align_right = QPushButton("우측")
+        self.btn_align_right.setStyleSheet(btn_style)
+        self.btn_align_right.clicked.connect(lambda: self.text_edit.setAlignment(Qt.AlignRight))
+        toolbar_layout.addWidget(self.btn_align_right)
+        
+        # List & Divider
+        self.btn_bullet = QPushButton("• 목록")
+        self.btn_bullet.setStyleSheet(btn_style)
+        self.btn_bullet.setToolTip("글머리 기호 목록 삽입")
+        self.btn_bullet.clicked.connect(self.insert_bullet_list)
+        toolbar_layout.addWidget(self.btn_bullet)
+        
+        self.btn_hr = QPushButton("― 선")
+        self.btn_hr.setStyleSheet(btn_style)
+        self.btn_hr.setToolTip("구분선 삽입")
+        self.btn_hr.clicked.connect(self.insert_hr)
+        toolbar_layout.addWidget(self.btn_hr)
+        
+        toolbar_layout.addStretch()
+        
+        # Image Insertion Button
+        self.btn_image = QPushButton("🖼️ 이미지 첨부")
+        self.btn_image.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.btn_image.setFixedHeight(30)
+        self.btn_image.setCursor(Qt.PointingHandCursor)
+        self.btn_image.setStyleSheet("""
+            QPushButton {
+                background-color: #3B82F6;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2563EB;
+            }
+        """)
+        self.btn_image.setToolTip("이미지 파일 추가 (캡처 후 Ctrl+V로 붙여넣기도 가능)")
+        self.btn_image.clicked.connect(self.choose_image)
+        toolbar_layout.addWidget(self.btn_image)
+        
+        layout.addWidget(toolbar_frame)
+        
+        # Text Editor
+        self.text_edit = RichTextEdit(self.base_dir)
+        self.text_edit.setFont(QFont('Malgun Gothic', 13))
+        self.text_edit.setStyleSheet("""
+            QTextEdit {
+                background-color: white;
+                border: 1.5px solid #CBD5E1;
+                border-radius: 10px;
+                padding: 14px;
+                font-size: 13pt;
+                color: #1E293B;
+                line-height: 1.6;
+            }
+            QTextEdit:focus {
+                border: 2px solid #3B82F6;
+            }
+        """)
+        self.text_edit.cursorPositionChanged.connect(self.on_cursor_position_changed)
         layout.addWidget(self.text_edit)
         
+        # Load initial content if provided
+        if self.initial_content:
+            raw = self.initial_content.strip()
+            if "<html" in raw or "<p" in raw or "<div" in raw or "<img" in raw or "<br" in raw:
+                self.text_edit.setHtml(raw)
+            else:
+                self.text_edit.setPlainText(raw)
+                
+        # Status / Guide Label
+        guide_label = QLabel("💡 TIP: 캡처 도구로 복사한 이미지를 <b>Ctrl+V</b>로 바로 붙여넣거나 사진 파일을 에디터로 드래그할 수 있습니다.")
+        guide_label.setFont(QFont('Malgun Gothic', 9))
+        guide_label.setStyleSheet("color: #64748B; padding-left: 4px;")
+        layout.addWidget(guide_label)
+        
+        # Action Buttons
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        
         cancel_btn = QPushButton('취소')
-        save_btn = QPushButton('저장')
+        save_btn = QPushButton('💾 일지 저장' if not is_edit_mode else '💾 변경사항 저장')
         for btn in (cancel_btn, save_btn):
             btn.setFont(QFont('Malgun Gothic', 12, QFont.Bold))
-            btn.setFixedHeight(45)
+            btn.setFixedHeight(48)
             btn.setCursor(Qt.PointingHandCursor)
         
-        cancel_btn.setStyleSheet("background-color: #E74C3C; color: white; border-radius: 5px;")
-        save_btn.setStyleSheet("background-color: #2ECC71; color: white; border-radius: 5px;")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E2E8F0;
+                color: #475569;
+                border-radius: 8px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #CBD5E1;
+            }
+        """)
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #10B981;
+                color: white;
+                border-radius: 8px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+        """)
         
         cancel_btn.clicked.connect(self.reject)
         save_btn.clicked.connect(self.save)
         
-        btn_layout.addWidget(cancel_btn)
-        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn, 1)
+        btn_layout.addWidget(save_btn, 2)
         layout.addLayout(btn_layout)
         
+    def toggle_bold(self):
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Bold if self.btn_bold.isChecked() else QFont.Normal)
+        self.text_edit.mergeCurrentCharFormat(fmt)
+        
+    def toggle_italic(self):
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(self.btn_italic.isChecked())
+        self.text_edit.mergeCurrentCharFormat(fmt)
+        
+    def toggle_underline(self):
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(self.btn_underline.isChecked())
+        self.text_edit.mergeCurrentCharFormat(fmt)
+        
+    def toggle_strike(self):
+        fmt = QTextCharFormat()
+        fmt.setFontStrikeOut(self.btn_strike.isChecked())
+        self.text_edit.mergeCurrentCharFormat(fmt)
+        
+    def change_font_size(self, size_str):
+        try:
+            pt = int(size_str.replace('pt', '').strip())
+            fmt = QTextCharFormat()
+            fmt.setFontPointSize(pt)
+            self.text_edit.mergeCurrentCharFormat(fmt)
+        except Exception:
+            pass
+            
+    def choose_text_color(self):
+        color = QColorDialog.getColor(self.current_text_color, self, "글자 색상 선택")
+        if color.isValid():
+            self.current_text_color = color
+            fmt = QTextCharFormat()
+            fmt.setForeground(QBrush(color))
+            self.text_edit.mergeCurrentCharFormat(fmt)
+            self.btn_color.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color.name()};
+                    color: {'white' if color.lightness() < 128 else 'black'};
+                    border: 1px solid #CBD5E1;
+                    border-radius: 5px;
+                    font-family: 'Malgun Gothic';
+                    font-size: 12px;
+                    font-weight: bold;
+                    padding: 4px 8px;
+                    min-height: 26px;
+                }}
+            """)
+            
+    def insert_bullet_list(self):
+        cursor = self.text_edit.textCursor()
+        cursor.insertList(QTextListFormat.ListDisc)
+        
+    def insert_hr(self):
+        cursor = self.text_edit.textCursor()
+        cursor.insertHtml('<hr style="border: 0; height: 1px; background: #CBD5E1; margin: 10px 0;"><p></p>')
+        
+    def choose_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "일지 첨부 이미지 선택", "", "이미지 파일 (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;모든 파일 (*.*)"
+        )
+        if file_path:
+            self.text_edit.insert_image_from_file(file_path)
+            
+    def on_cursor_position_changed(self):
+        fmt = self.text_edit.currentCharFormat()
+        self.btn_bold.blockSignals(True)
+        self.btn_bold.setChecked(fmt.fontWeight() == QFont.Bold)
+        self.btn_bold.blockSignals(False)
+        
+        self.btn_italic.blockSignals(True)
+        self.btn_italic.setChecked(fmt.fontItalic())
+        self.btn_italic.blockSignals(False)
+        
+        self.btn_underline.blockSignals(True)
+        self.btn_underline.setChecked(fmt.fontUnderline())
+        self.btn_underline.blockSignals(False)
+        
+        self.btn_strike.blockSignals(True)
+        self.btn_strike.setChecked(fmt.fontStrikeOut())
+        self.btn_strike.blockSignals(False)
+        
+        pt = int(fmt.fontPointSize())
+        if pt > 0:
+            target_str = f"{pt}pt"
+            idx = self.size_combo.findText(target_str)
+            if idx >= 0 and self.size_combo.currentIndex() != idx:
+                self.size_combo.blockSignals(True)
+                self.size_combo.setCurrentIndex(idx)
+                self.size_combo.blockSignals(False)
+                
     def save(self):
-        self.result_text = self.text_edit.toPlainText().strip()
-        if not self.result_text:
-            QMessageBox.warning(self, '경고', '수업 내용을 입력하세요.')
+        raw_text = self.text_edit.toPlainText().strip()
+        html_text = self.text_edit.toHtml()
+        if not raw_text and '<img' not in html_text:
+            QMessageBox.warning(self, '경고', '수업 내용 또는 이미지를 입력하세요.')
             return
+        self.result_text = html_text
         self.accept()
 
 class EmotionSelectDialog(QDialog):
@@ -346,7 +750,7 @@ class LogHistoryDialog(QDialog):
         
     def initUI(self):
         self.setWindowTitle(f'{self.class_name} 전체 수업 기록')
-        self.resize(550, 650)
+        self.resize(680, 750)
         self.setStyleSheet("background-color: #F8FAFC;")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -458,10 +862,24 @@ class LogHistoryDialog(QDialog):
             date_layout.addWidget(hint_label, alignment=Qt.AlignRight)
             card_layout.addLayout(date_layout)
             
-            content_label = QLabel(log['content'])
-            content_label.setFont(QFont('Malgun Gothic', 13))
+            raw_content = log.get('content', '')
+            is_rich = any(tag in raw_content for tag in ['<!DOCTYPE', '<html', '<body', '<p', '<div', '<img', '<span', '<br'])
+            if is_rich:
+                content_html = raw_content
+                if '<body' in content_html and '</body>' in content_html:
+                    try:
+                        content_html = content_html.split('<body', 1)[1].split('>', 1)[1].rsplit('</body>', 1)[0].strip()
+                    except Exception:
+                        content_html = raw_content
+            else:
+                content_html = html.escape(raw_content).replace('\n', '<br>')
+                
+            content_label = QLabel(content_html)
+            content_label.setTextFormat(Qt.RichText)
+            content_label.setFont(QFont('Malgun Gothic', 12))
             content_label.setStyleSheet("color: #2C3E50; border: none; margin-top: 5px;")
             content_label.setWordWrap(True)
+            content_label.setOpenExternalLinks(False)
             card_layout.addWidget(content_label)
             
             self.scroll_layout.addWidget(card)
@@ -487,10 +905,10 @@ class LogHistoryDialog(QDialog):
             self.delete_log(idx)
             
     def edit_log(self, idx):
-        old_content = self.logs[idx]['content']
-        text, ok = QInputDialog.getMultiLineText(self, '수업 기록 수정', '내용을 수정하세요:', old_content)
-        if ok and text.strip():
-            self.logs[idx]['content'] = text.strip()
+        old_content = self.logs[idx].get('content', '')
+        dlg = LogWriteDialog(self.class_name, initial_content=old_content, parent=self.parent_app or self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.logs[idx]['content'] = dlg.result_text
             self.save_and_redraw()
 
     def delete_log(self, idx):
@@ -1511,14 +1929,16 @@ class PresenterRouletteDialog(QDialog):
         winner_idx = self.pool.index(self.winner)
         delta = 360.0 / len(self.pool)
         
-        # target theta to align center of winner slice under top needle
-        jitter = random.uniform(-0.25, 0.25) * delta
-        target_theta = (360.0 - (winner_idx + 0.5 + jitter) * delta) % 360.0
+        # 슬라이스 중앙에 바늘(12시)이 정확히 오도록 target_theta 계산
+        jitter_deg = random.uniform(-0.20, 0.20) * delta
+        target_theta = (360.0 - (winner_idx + 0.5) * delta - jitter_deg) % 360.0
         
-        # 5 to 7 full revolutions
+        # 현재 각도에서 시작하여 시계 방향으로 5~7바퀴 돌고 target_theta에 정확히 멈춤
         full_turns = 360.0 * random.randint(5, 7)
-        self.total_spin_angle = full_turns + target_theta
-        self.start_angle = self.current_angle % 360.0
+        cur = self.current_angle
+        diff = (target_theta - (cur % 360.0)) % 360.0
+        self.start_angle = cur
+        self.total_spin_angle = cur + full_turns + diff
         
         self.spin_btn.setEnabled(False)
         self.spin_btn.setText("원판 회전 중... 🎡")
@@ -1555,9 +1975,12 @@ class PresenterRouletteDialog(QDialog):
             self.is_spinning = False
             self.is_finished = True
             self.needle_wiggle = 0.0
+            self.current_angle = self.total_spin_angle
             self.wheel_widget.update()
             
-            # Ensure final winner is selected and shown directly on roulette screen
+            # 물리적으로 12시 바늘이 가리키는 실제 인덱스로 당첨자 최종 확정
+            final_idx = self.get_current_index()
+            self.winner = self.pool[final_idx]
             self.update_indicator_card(self.winner)
             self.spin_btn.setEnabled(True)
             self.spin_btn.setText("🎡 다시 돌리기")
@@ -1579,9 +2002,9 @@ class PresenterRouletteDialog(QDialog):
         self.is_spinning = False
         self.is_finished = True
         self.needle_wiggle = 0.0
-        if not hasattr(self, 'winner') or not self.winner:
-            self.winner = random.choice(self.pool)
         self.current_angle = self.total_spin_angle
+        final_idx = self.get_current_index()
+        self.winner = self.pool[final_idx]
         self.update_indicator_card(self.winner)
         self.spin_btn.setEnabled(True)
         self.spin_btn.setText("🎡 다시 돌리기")
@@ -1649,16 +2072,52 @@ class LadderCanvasWidget(QWidget):
             for x in xs:
                 painter.drawLine(x, top_y, x, bot_y)
                 
-            # 2. 가로 다리(Bridge)
-            pen_bridge = QPen(QColor("#475569"), 4, Qt.SolidLine, Qt.RoundCap)
-            painter.setPen(pen_bridge)
-            for c, lvl in self.dlg.bridges:
-                if c < num_cols - 1:
-                    y = int(top_y + (lvl / (self.dlg.num_levels + 1)) * ladder_h)
-                    painter.drawLine(xs[c], y, xs[c + 1], y)
+            # 2. 가로 다리(Bridge) 또는 시작 전 가운데 가림막
+            if not self.dlg.is_blind:
+                pen_bridge = QPen(QColor("#475569"), 4, Qt.SolidLine, Qt.RoundCap)
+                painter.setPen(pen_bridge)
+                for c, lvl in self.dlg.bridges:
+                    if c < num_cols - 1:
+                        y = int(top_y + (lvl / (self.dlg.num_levels + 1)) * ladder_h)
+                        painter.drawLine(xs[c], y, xs[c + 1], y)
+            else:
+                # 시작 전 사다리 가운데 영역을 보이지 않게 가려주는 비밀 가림막 (Blind Curtain)
+                blind_rect = QRectF(xs[0] - 30, top_y + 18, (xs[-1] - xs[0]) + 60, ladder_h - 36)
+                
+                # 그림자
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(0, 0, 0, 130))
+                painter.drawRoundedRect(blind_rect.translated(3, 4), 18, 18)
+                
+                # 가림막 메인 패널
+                painter.setPen(QPen(QColor("#3B82F6"), 2, Qt.DashLine))
+                painter.setBrush(QBrush(QColor("#1E293B")))
+                painter.drawRoundedRect(blind_rect, 18, 18)
+                
+                # 가림막 내부 가로 장식 점선
+                painter.setPen(QPen(QColor("#334155"), 1, Qt.DotLine))
+                for py in range(int(blind_rect.top()) + 25, int(blind_rect.bottom()) - 10, 32):
+                    painter.drawLine(int(blind_rect.left() + 20), py, int(blind_rect.right() - 20), py)
+                
+                # 중앙 락 아이콘 및 안내 문구
+                mid_x = (xs[0] + xs[-1]) / 2.0
+                mid_y = top_y + ladder_h / 2.0
+                
+                painter.setPen(QColor("#60A5FA"))
+                painter.setFont(QFont('Segoe UI Emoji', 36))
+                painter.drawText(QRectF(mid_x - 50, mid_y - 60, 100, 52), Qt.AlignCenter, "🔒")
+                
+                painter.setPen(QColor("#F8FAFC"))
+                painter.setFont(QFont('Malgun Gothic', 16, QFont.Bold))
+                painter.drawText(QRectF(mid_x - 250, mid_y - 4, 500, 32), Qt.AlignCenter, "사다리 경로 비공개 가림막")
+                
+                painter.setPen(QColor("#94A3B8"))
+                painter.setFont(QFont('Malgun Gothic', 11))
+                painter.drawText(QRectF(mid_x - 250, mid_y + 28, 500, 26), Qt.AlignCenter, "시작 버튼을 누르면 가림막이 열리고 사다리가 시작됩니다! 🚀")
                     
-            # 3. 진행된 경로선(Trace) & 이동 구슬
+            # 3. 진행된 경로선(Trace) & 사다리를 타는 학생 사진 아바타
             if self.dlg.progress > 0.0:
+                markers_to_draw = []
                 for k in range(num_cols):
                     color = QColor(self.dlg.colors[k])
                     pen_trace = QPen(color, 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
@@ -1691,10 +2150,53 @@ class LadderCanvasWidget(QWidget):
                             last_pt = inter_px
                             break
                             
-                    # 빛나는 마커 구슬 (선 끝점에 정확히 일치)
-                    painter.setPen(QPen(Qt.white, 3))
-                    painter.setBrush(QBrush(color))
-                    painter.drawEllipse(last_pt, 9, 9)
+                    markers_to_draw.append((k, last_pt, color))
+                    
+                # 사다리 선 위에 실시간으로 이동하는 학생 원형 사진 아바타 그리기
+                avatar_r = min(20.0, max(14.0, col_w * 0.20))
+                for k, pt, color in markers_to_draw:
+                    cand = self.dlg.pool[k]
+                    p_path = cand.get('photo', '')
+                    
+                    # 그림자 효과
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(0, 0, 0, 100))
+                    painter.drawEllipse(QPointF(pt.x() + 1.5, pt.y() + 1.5), avatar_r + 2, avatar_r + 2)
+                    
+                    # 배경 바탕 원
+                    painter.setPen(QPen(color, 3.5))
+                    painter.setBrush(QBrush(QColor("#1E293B")))
+                    painter.drawEllipse(pt, avatar_r, avatar_r)
+                    
+                    # 학생 사진 렌더링 (원형 클리핑)
+                    if p_path and os.path.exists(p_path):
+                        pix = QPixmap(p_path).scaled(int((avatar_r - 2) * 2), int((avatar_r - 2) * 2), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                        path_clip = QPainterPath()
+                        path_clip.addEllipse(pt, avatar_r - 2, avatar_r - 2)
+                        painter.save()
+                        painter.setClipPath(path_clip)
+                        painter.drawPixmap(int(pt.x() - (avatar_r - 2)), int(pt.y() - (avatar_r - 2)), pix)
+                        painter.restore()
+                    else:
+                        painter.setPen(QColor(color))
+                        painter.setFont(QFont('Segoe UI Emoji', int(avatar_r * 0.9)))
+                        painter.drawText(QRectF(pt.x() - avatar_r, pt.y() - avatar_r, avatar_r * 2, avatar_r * 2), Qt.AlignCenter, "👤")
+                        
+                    # 학생 테두리 하이라이트 링
+                    painter.setPen(QPen(color, 2.5))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawEllipse(pt, avatar_r, avatar_r)
+                    
+                    # 아바타 상단 미니 이름 태그
+                    tag_w = max(44.0, avatar_r * 2.5)
+                    tag_h = 16.0
+                    tag_rect = QRectF(pt.x() - tag_w / 2.0, pt.y() - avatar_r - tag_h - 2.0, tag_w, tag_h)
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(QColor(15, 23, 42, 210)))
+                    painter.drawRoundedRect(tag_rect, 5, 5)
+                    painter.setPen(QColor("#FFFFFF"))
+                    painter.setFont(QFont('Malgun Gothic', 8, QFont.Bold))
+                    painter.drawText(tag_rect, Qt.AlignCenter, cand['name'])
                     
             # 4. 상단 학생 정보
             for i, cand in enumerate(self.dlg.pool):
@@ -1781,6 +2283,7 @@ class PresenterLadderDialog(QDialog):
         self.is_running = False
         self.is_finished = False
         self.progress = 0.0
+        self.is_blind = True  # 시작 전 사다리 가운데 부분을 비밀 가림막으로 가림
         
         self.init_ladder_data()
         self.initUI()
@@ -1986,6 +2489,18 @@ class PresenterLadderDialog(QDialog):
         self.restart_btn.clicked.connect(self.reset_ladder)
         btn_bar.addWidget(self.restart_btn)
         
+        self.blind_btn = QPushButton("👀 사다리 미리보기")
+        self.blind_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
+        self.blind_btn.setFixedHeight(54)
+        self.blind_btn.setFixedWidth(160)
+        self.blind_btn.setCursor(Qt.PointingHandCursor)
+        self.blind_btn.setStyleSheet("""
+            QPushButton { background-color: #334155; color: #CBD5E1; border-radius: 12px; border: 1px solid #475569; }
+            QPushButton:hover { background-color: #475569; color: white; }
+        """)
+        self.blind_btn.clicked.connect(self.toggle_blind)
+        btn_bar.addWidget(self.blind_btn)
+        
         self.close_btn = QPushButton("확인 (닫기)")
         self.close_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
         self.close_btn.setFixedHeight(54)
@@ -2004,6 +2519,12 @@ class PresenterLadderDialog(QDialog):
         # 애니메이션 타이머
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_animation)
+        
+    def toggle_blind(self):
+        self.is_blind = not self.is_blind
+        self.blind_btn.setText("🙈 사다리 가리기" if not self.is_blind else "👀 사다리 미리보기")
+        if hasattr(self, 'canvas'):
+            self.canvas.update()
         
     def play_fanfare(self):
         self.player = QMediaPlayer(None, QMediaPlayer.LowLatency)
@@ -2031,6 +2552,9 @@ class PresenterLadderDialog(QDialog):
             
         self.is_running = True
         self.is_finished = False
+        self.is_blind = False  # 사다리 타기 시작 시 가림막 해제
+        if hasattr(self, 'blind_btn'):
+            self.blind_btn.setText("🙈 사다리 가리기")
         self.progress = 0.0
         self.start_btn.setEnabled(False)
         self.start_btn.setText("사다리 타는 중... 🪜")
@@ -2070,6 +2594,9 @@ class PresenterLadderDialog(QDialog):
         self.timer.stop()
         self.is_running = False
         self.is_finished = True
+        self.is_blind = False  # 결과 보기 시 가림막 해제
+        if hasattr(self, 'blind_btn'):
+            self.blind_btn.setText("🙈 사다리 가리기")
         self.progress = 1.0
         self.start_btn.setEnabled(True)
         self.start_btn.setText("▶️ 다시 타기")
@@ -2087,6 +2614,9 @@ class PresenterLadderDialog(QDialog):
             self.player.stop()
         self.is_running = False
         self.is_finished = False
+        self.is_blind = True  # 사다리 재설정 시 다시 가림막 활성화
+        if hasattr(self, 'blind_btn'):
+            self.blind_btn.setText("👀 사다리 미리보기")
         self.progress = 0.0
         self.start_btn.setEnabled(True)
         self.start_btn.setText("▶️  사다리 타기 시작!")
@@ -4610,19 +5140,33 @@ class StudentAttendanceApp(QWidget):
                 content = last_log.get('content', '')
                 date_str = last_log.get('date', '')
                 
-                # 줄 단위 파싱 및 카드형 항목 렌더링
-                raw_lines = content.split('\n')
-                items_html = ""
-                for l in raw_lines:
-                    text_l = l.strip()
-                    if not text_l:
-                        items_html += '<div style="height: 10px;"></div>'
-                        continue
-                    items_html += f"""
-                    <div style="margin-bottom: 12px; padding: 12px 18px; background-color: #F8FAFC; border-left: 6px solid #3B82F6; border-radius: 8px;">
-                        <span style="font-size: 21pt; font-weight: bold; color: #1E293B;">{html.escape(text_l)}</span>
+                # 일지 내용 렌더링 (리치 텍스트 HTML 지원)
+                is_rich = any(tag in content for tag in ['<!DOCTYPE', '<html', '<body', '<p', '<div', '<img', '<span', '<br'])
+                if is_rich:
+                    body_content = content
+                    if '<body' in content and '</body>' in content:
+                        try:
+                            body_content = content.split('<body', 1)[1].split('>', 1)[1].rsplit('</body>', 1)[0].strip()
+                        except Exception:
+                            body_content = content
+                    items_html = f"""
+                    <div style="margin-bottom: 12px; padding: 18px 22px; background-color: #FFFFFF; border: 1.5px solid #E2E8F0; border-radius: 12px; font-size: 14pt; color: #1E293B; line-height: 1.6;">
+                        {body_content}
                     </div>
                     """
+                else:
+                    raw_lines = content.split('\n')
+                    items_html = ""
+                    for l in raw_lines:
+                        text_l = l.strip()
+                        if not text_l:
+                            items_html += '<div style="height: 10px;"></div>'
+                            continue
+                        items_html += f"""
+                        <div style="margin-bottom: 12px; padding: 12px 18px; background-color: #F8FAFC; border-left: 6px solid #3B82F6; border-radius: 8px;">
+                            <span style="font-size: 18pt; font-weight: bold; color: #1E293B;">{html.escape(text_l)}</span>
+                        </div>
+                        """
                 
                 html_body = f"""
                 <div style="font-family: 'Malgun Gothic', sans-serif; padding: 10px 15px;">
