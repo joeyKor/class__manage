@@ -5,9 +5,9 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QFrame, QGraphicsDropShadowEffect,
                              QListWidget, QListWidgetItem, QPushButton, QComboBox, QDialog, QTextEdit, QMessageBox, QScrollArea, QMenu, QInputDialog, QGridLayout,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QColorDialog, QToolButton)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QColorDialog, QToolButton, QTabWidget, QSplitter)
 from PyQt5.QtGui import (QPixmap, QFont, QColor, QKeyEvent, QCursor, QPainter, QPen, QBrush, QPainterPath,
-                         QImage, QTextCursor, QTextCharFormat, QTextBlockFormat, QTextListFormat)
+                         QImage, QTextCursor, QTextCharFormat, QTextBlockFormat, QTextListFormat, QIcon)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QUrl, QPropertyAnimation, QEasingCurve, QRect, QRectF, QSize, QEvent, QPointF
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from collections import Counter
@@ -15,6 +15,53 @@ import json
 import random
 import html
 import math
+import shutil
+import re
+
+def resolve_image_paths(html_content, base_dir):
+    """
+    HTML 내의 <img src="..."> 경로가 과거 절대 경로이거나 상대 경로일 경우,
+    현재 실행 디렉토리의 log_images 폴더를 기준으로 올바른 로컬 URL(file:///)로 자동 변환합니다.
+    """
+    if not html_content or '<img' not in html_content:
+        return html_content
+
+    log_img_dir = os.path.join(base_dir, 'log_images')
+
+    def replace_src(match):
+        orig_src = match.group(1)
+        # 이미 유효한 file:/// URL이거나 파일이 직접 존재하는지 확인
+        cleaned_path = orig_src.replace('file:///', '')
+        if os.path.exists(cleaned_path):
+            abs_path = os.path.abspath(cleaned_path).replace('\\', '/')
+            return f'src="file:///{abs_path}"'
+
+        # 파일명만 추출하여 현재 log_images 폴더에서 탐색
+        filename = os.path.basename(orig_src.replace('\\', '/'))
+        candidate_path = os.path.join(log_img_dir, filename)
+        if os.path.exists(candidate_path):
+            abs_path = os.path.abspath(candidate_path).replace('\\', '/')
+            return f'src="file:///{abs_path}"'
+
+        # 그대로 유지
+        return f'src="{orig_src}"'
+
+    return re.sub(r'src=["\']([^"\']+)["\']', replace_src, html_content)
+
+def relativize_image_paths(html_content, base_dir):
+    """
+    HTML 저장 시 절대 경로를 'log_images/파일명' 상대 경로로 정규화하여
+    폴더 위치나 드라이브가 바뀌어도 일지가 손상되지 않도록 합니다.
+    """
+    if not html_content or '<img' not in html_content:
+        return html_content
+
+    def replace_to_relative(match):
+        orig_src = match.group(1)
+        filename = os.path.basename(orig_src.replace('\\', '/').replace('file:///', ''))
+        return f'src="log_images/{filename}"'
+
+    return re.sub(r'src=["\']([^"\']+)["\']', replace_to_relative, html_content)
 
 class TTSThread(QThread):
     def __init__(self, text, parent=None):
@@ -214,14 +261,15 @@ class RichTextEdit(QTextEdit):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         ext = orig_ext if orig_ext.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.webp'] else '.png'
         filename = f"log_img_{timestamp}{ext}"
-        saved_path = os.path.abspath(os.path.join(img_dir, filename)).replace('\\', '/')
+        abs_saved_path = os.path.abspath(os.path.join(img_dir, filename)).replace('\\', '/')
         
         fmt = "PNG" if ext == ".png" else "JPEG"
-        image.save(saved_path, fmt)
+        image.save(abs_saved_path, fmt)
 
         disp_width = min(image.width(), 460)
         cursor = self.textCursor()
-        cursor.insertHtml(f'<p><img src="{saved_path}" width="{disp_width}" style="max-width:100%; border-radius:8px; margin:6px 0;"></p><p></p>')
+        # 에디터 내부 실시간 표시용으로는 file:/// 절대 URL 사용
+        cursor.insertHtml(f'<p><img src="file:///{abs_saved_path}" width="{disp_width}" style="max-width:100%; border-radius:8px; margin:6px 0;"></p><p></p>')
         self.ensureCursorVisible()
 
     def insert_image_from_file(self, file_path):
@@ -475,7 +523,9 @@ class LogWriteDialog(QDialog):
         if self.initial_content:
             raw = self.initial_content.strip()
             if "<html" in raw or "<p" in raw or "<div" in raw or "<img" in raw or "<br" in raw:
-                self.text_edit.setHtml(raw)
+                # 과거/상대 경로 이미지를 현재 환경에 맞춰 올바르게 로드
+                resolved = resolve_image_paths(raw, self.base_dir)
+                self.text_edit.setHtml(resolved)
             else:
                 self.text_edit.setPlainText(raw)
                 
@@ -624,7 +674,8 @@ class LogWriteDialog(QDialog):
         if not raw_text and '<img' not in html_text:
             QMessageBox.warning(self, '경고', '수업 내용 또는 이미지를 입력하세요.')
             return
-        self.result_text = html_text
+        # 저장 시 경로를 상대 경로('log_images/파일명')로 변환하여 저장
+        self.result_text = relativize_image_paths(html_text, self.base_dir)
         self.accept()
 
 class EmotionSelectDialog(QDialog):
@@ -865,12 +916,13 @@ class LogHistoryDialog(QDialog):
             raw_content = log.get('content', '')
             is_rich = any(tag in raw_content for tag in ['<!DOCTYPE', '<html', '<body', '<p', '<div', '<img', '<span', '<br'])
             if is_rich:
-                content_html = raw_content
+                base_d = getattr(self.parent_app, 'base_dir', os.path.dirname(os.path.abspath(__file__)))
+                content_html = resolve_image_paths(raw_content, base_d)
                 if '<body' in content_html and '</body>' in content_html:
                     try:
                         content_html = content_html.split('<body', 1)[1].split('>', 1)[1].rsplit('</body>', 1)[0].strip()
                     except Exception:
-                        content_html = raw_content
+                        pass
             else:
                 content_html = html.escape(raw_content).replace('\n', '<br>')
                 
@@ -2116,9 +2168,21 @@ class LadderCanvasWidget(QWidget):
                 painter.drawText(QRectF(mid_x - 250, mid_y + 28, 500, 26), Qt.AlignCenter, "시작 버튼을 누르면 가림막이 열리고 사다리가 시작됩니다! 🚀")
                     
             # 3. 진행된 경로선(Trace) & 사다리를 타는 학생 사진 아바타
-            if self.dlg.progress > 0.0:
+            has_progress = hasattr(self.dlg, 'progresses') and any(p > 0.0 for p in self.dlg.progresses)
+            if has_progress:
+                lead_k = -1
+                max_prog = -1.0
+                for k in range(num_cols):
+                    if not self.dlg.finished_students[k] and self.dlg.progresses[k] > max_prog:
+                        max_prog = self.dlg.progresses[k]
+                        lead_k = k
+                        
                 markers_to_draw = []
                 for k in range(num_cols):
+                    prog = self.dlg.progresses[k]
+                    if prog <= 0.0:
+                        continue
+                        
                     color = QColor(self.dlg.colors[k])
                     pen_trace = QPen(color, 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
                     painter.setPen(pen_trace)
@@ -2126,7 +2190,7 @@ class LadderCanvasWidget(QWidget):
                     
                     path = self.dlg.paths[k]
                     tot_d = self.dlg.path_lengths[k]
-                    target_d = self.dlg.progress * tot_d
+                    target_d = prog * tot_d
                     
                     accum = 0.0
                     last_pt = QPointF(xs[int(round(path[0][0]))], top_y)
@@ -2150,25 +2214,25 @@ class LadderCanvasWidget(QWidget):
                             last_pt = inter_px
                             break
                             
-                    markers_to_draw.append((k, last_pt, color))
+                    is_leader = (k == lead_k and not self.dlg.finished_students[k] and num_cols > 2)
+                    markers_to_draw.append((k, last_pt, color, is_leader))
                     
                 # 사다리 선 위에 실시간으로 이동하는 학생 원형 사진 아바타 그리기
-                avatar_r = min(20.0, max(14.0, col_w * 0.20))
-                for k, pt, color in markers_to_draw:
+                avatar_r = min(22.0, max(14.0, col_w * 0.20))
+                for k, pt, color, is_leader in markers_to_draw:
                     cand = self.dlg.pool[k]
                     p_path = cand.get('photo', '')
+                    is_fin = self.dlg.finished_students[k]
                     
-                    # 그림자 효과
                     painter.setPen(Qt.NoPen)
-                    painter.setBrush(QColor(0, 0, 0, 100))
-                    painter.drawEllipse(QPointF(pt.x() + 1.5, pt.y() + 1.5), avatar_r + 2, avatar_r + 2)
+                    painter.setBrush(QColor(0, 0, 0, 110))
+                    painter.drawEllipse(QPointF(pt.x() + 2, pt.y() + 2), avatar_r + 2, avatar_r + 2)
                     
-                    # 배경 바탕 원
-                    painter.setPen(QPen(color, 3.5))
+                    border_color = QColor("#FBBF24") if is_leader else color
+                    painter.setPen(QPen(border_color, 4 if is_leader else 3.5))
                     painter.setBrush(QBrush(QColor("#1E293B")))
                     painter.drawEllipse(pt, avatar_r, avatar_r)
                     
-                    # 학생 사진 렌더링 (원형 클리핑)
                     if p_path and os.path.exists(p_path):
                         pix = QPixmap(p_path).scaled(int((avatar_r - 2) * 2), int((avatar_r - 2) * 2), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
                         path_clip = QPainterPath()
@@ -2182,23 +2246,28 @@ class LadderCanvasWidget(QWidget):
                         painter.setFont(QFont('Segoe UI Emoji', int(avatar_r * 0.9)))
                         painter.drawText(QRectF(pt.x() - avatar_r, pt.y() - avatar_r, avatar_r * 2, avatar_r * 2), Qt.AlignCenter, "👤")
                         
-                    # 학생 테두리 하이라이트 링
-                    painter.setPen(QPen(color, 2.5))
+                    painter.setPen(QPen(border_color, 2.5))
                     painter.setBrush(Qt.NoBrush)
                     painter.drawEllipse(pt, avatar_r, avatar_r)
                     
-                    # 아바타 상단 미니 이름 태그
-                    tag_w = max(44.0, avatar_r * 2.5)
-                    tag_h = 16.0
-                    tag_rect = QRectF(pt.x() - tag_w / 2.0, pt.y() - avatar_r - tag_h - 2.0, tag_w, tag_h)
+                    tag_w = max(48.0, avatar_r * 2.6)
+                    tag_h = 17.0
+                    tag_rect = QRectF(pt.x() - tag_w / 2.0, pt.y() - avatar_r - tag_h - 3.0, tag_w, tag_h)
                     painter.setPen(Qt.NoPen)
-                    painter.setBrush(QBrush(QColor(15, 23, 42, 210)))
-                    painter.drawRoundedRect(tag_rect, 5, 5)
-                    painter.setPen(QColor("#FFFFFF"))
-                    painter.setFont(QFont('Malgun Gothic', 8, QFont.Bold))
-                    painter.drawText(tag_rect, Qt.AlignCenter, cand['name'])
+                    painter.setBrush(QBrush(QColor(15, 23, 42, 220)))
+                    painter.drawRoundedRect(tag_rect, 6, 6)
                     
-            # 4. 상단 학생 정보
+                    painter.setPen(QColor("#FBBF24") if is_leader else QColor("#FFFFFF"))
+                    painter.setFont(QFont('Malgun Gothic', 8, QFont.Bold))
+                    
+                    display_text = cand['name']
+                    if is_fin:
+                        display_text += " ✓"
+                    elif is_leader:
+                        display_text = "⚡ " + cand['name']
+                    painter.drawText(tag_rect, Qt.AlignCenter, display_text)
+                    
+            # 4. 상단 학생 정보 카드
             for i, cand in enumerate(self.dlg.pool):
                 cx = xs[i]
                 photo_size = 46
@@ -2230,39 +2299,53 @@ class LadderCanvasWidget(QWidget):
                 painter.setPen(QColor(self.dlg.colors[i]))
                 painter.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
                 painter.drawText(name_rect, Qt.AlignCenter, cand['name'])
+                
+            # 5. 하단 결과 슬롯 카드 (먼저 도착한 학생부터 실시간 오픈!)
+            for i in range(num_cols):
+                cx = xs[i]
+                slot_rect = QRect(cx - 54, bot_y + 16, 108, 56)
+                res = self.dlg.slot_results[i] if hasattr(self.dlg, 'slot_results') and i < len(self.dlg.slot_results) else None
+                
+                if res is None:
+                    painter.setPen(QPen(QColor("#475569"), 2))
+                    painter.setBrush(QBrush(QColor("#1E293B")))
+                    painter.drawRoundedRect(slot_rect, 12, 12)
+                    
+                    painter.setPen(QColor("#F1C40F"))
+                    painter.setFont(QFont('Segoe UI Emoji', 16))
+                    painter.drawText(QRectF(slot_rect.left(), slot_rect.top() + 4, slot_rect.width(), 26), Qt.AlignCenter, "❓")
+                    
+                    painter.setPen(QColor("#64748B"))
+                    painter.setFont(QFont('Malgun Gothic', 8, QFont.Bold))
+                    painter.drawText(QRectF(slot_rect.left(), slot_rect.top() + 32, slot_rect.width(), 18), Qt.AlignCenter, "대기 중")
+                else:
+                    cand = res['cand']
+                    if res['is_winner']:
+                        painter.setPen(QPen(QColor("#F59E0B"), 3))
+                        painter.setBrush(QBrush(QColor("#064E3B")))
+                        painter.drawRoundedRect(slot_rect, 12, 12)
+                        
+                        painter.setPen(QColor("#FDE047"))
+                        painter.setFont(QFont('Malgun Gothic', 10, QFont.Bold))
+                        painter.drawText(QRectF(slot_rect.left(), slot_rect.top() + 6, slot_rect.width(), 20), Qt.AlignCenter, "🎯 발표자 당첨!")
+                        
+                        painter.setPen(QColor("#FFFFFF"))
+                        painter.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+                        painter.drawText(QRectF(slot_rect.left(), slot_rect.top() + 28, slot_rect.width(), 22), Qt.AlignCenter, f"👑 {cand['name']}")
+                    else:
+                        painter.setPen(QPen(QColor("#3B82F6"), 1.5))
+                        painter.setBrush(QBrush(QColor("#1E293B")))
+                        painter.drawRoundedRect(slot_rect, 12, 12)
+                        
+                        painter.setPen(QColor("#38BDF8"))
+                        painter.setFont(QFont('Malgun Gothic', 10, QFont.Bold))
+                        painter.drawText(QRectF(slot_rect.left(), slot_rect.top() + 6, slot_rect.width(), 20), Qt.AlignCenter, "☕ 통과 (세이프)")
+                        
+                        painter.setPen(QColor("#E2E8F0"))
+                        painter.setFont(QFont('Malgun Gothic', 10))
+                        painter.drawText(QRectF(slot_rect.left(), slot_rect.top() + 28, slot_rect.width(), 22), Qt.AlignCenter, f"😄 {cand['name']}")
         except Exception as e:
             print("LadderCanvasWidget paint error:", e)
-            
-        # 5. 하단 결과 슬롯 카드
-        for i in range(num_cols):
-            cx = xs[i]
-            slot_rect = QRect(cx - 52, bot_y + 18, 104, 52)
-            
-            if not self.dlg.is_finished:
-                painter.setPen(QPen(QColor("#475569"), 2))
-                painter.setBrush(QBrush(QColor("#1E293B")))
-                painter.drawRoundedRect(slot_rect, 12, 12)
-                
-                painter.setPen(QColor("#F1C40F"))
-                painter.setFont(QFont('Malgun Gothic', 18, QFont.Bold))
-                painter.drawText(slot_rect, Qt.AlignCenter, "❓")
-            else:
-                if i == self.dlg.win_slot:
-                    painter.setPen(QPen(QColor("#34D399"), 3))
-                    painter.setBrush(QBrush(QColor("#065F46")))
-                    painter.drawRoundedRect(slot_rect, 12, 12)
-                    
-                    painter.setPen(QColor("#FBBF24"))
-                    painter.setFont(QFont('Malgun Gothic', 12, QFont.Bold))
-                    painter.drawText(slot_rect, Qt.AlignCenter, "🎯 발표자!")
-                else:
-                    painter.setPen(QPen(QColor("#334155"), 1))
-                    painter.setBrush(QBrush(QColor("#0F172A")))
-                    painter.drawRoundedRect(slot_rect, 12, 12)
-                    
-                    painter.setPen(QColor("#94A3B8"))
-                    painter.setFont(QFont('Malgun Gothic', 11))
-                    painter.drawText(slot_rect, Qt.AlignCenter, "☕ 통과")
 
 
 class PresenterLadderDialog(QDialog):
@@ -2283,7 +2366,7 @@ class PresenterLadderDialog(QDialog):
         self.is_running = False
         self.is_finished = False
         self.progress = 0.0
-        self.is_blind = True  # 시작 전 사다리 가운데 부분을 비밀 가림막으로 가림
+        self.is_blind = True
         
         self.init_ladder_data()
         self.initUI()
@@ -2292,11 +2375,15 @@ class PresenterLadderDialog(QDialog):
         self.num_cols = len(self.pool)
         if self.num_cols <= 1:
             self.winner = self.pool[0] if self.pool else None
+            self.progresses = [1.0]
+            self.speeds = [0.0]
+            self.finished_students = [True]
+            self.slot_results = [{'cand': self.pool[0], 'is_winner': True}] if self.pool else [None]
+            self.progress = 1.0
             return
             
         self.num_levels = max(9, min(14, self.num_cols * 2))
         
-        # 가로 다리 생성
         self.bridges = []
         for lvl in range(1, self.num_levels + 1):
             cols_avail = list(range(self.num_cols - 1))
@@ -2311,7 +2398,6 @@ class PresenterLadderDialog(QDialog):
             for lvl in range(1, self.num_levels + 1):
                 self.bridges.append((lvl % (self.num_cols - 1), lvl))
                 
-        # 각 학생 경로 계산
         self.paths = []
         for start_col in range(self.num_cols):
             curr_col = start_col
@@ -2329,7 +2415,6 @@ class PresenterLadderDialog(QDialog):
             pts.append((float(curr_col), 1.0))
             self.paths.append(pts)
             
-        # 경로 누적 거리 계산
         self.seg_dists = []
         self.path_lengths = []
         for path in self.paths:
@@ -2344,7 +2429,6 @@ class PresenterLadderDialog(QDialog):
             self.seg_dists.append(dists)
             self.path_lengths.append(tot)
             
-        # 당첨 슬롯 지정 및 당첨자 추출
         self.win_slot = random.randint(0, self.num_cols - 1)
         for idx, path in enumerate(self.paths):
             if int(round(path[-1][0])) == self.win_slot:
@@ -2359,6 +2443,14 @@ class PresenterLadderDialog(QDialog):
             "#4ADE80", "#F43F5E", "#06B6D4", "#E879F9", "#FACC15"
         ]
         self.colors = [palette[i % len(palette)] for i in range(self.num_cols)]
+        
+        self.progresses = [0.0] * self.num_cols
+        self.base_speeds = [random.uniform(0.0067, 0.0074) for _ in range(self.num_cols)]
+        self.speeds = list(self.base_speeds)
+        self.finished_students = [False] * self.num_cols
+        self.slot_results = [None] * self.num_cols
+        self.first_winner_revealed = False
+        self.progress = 0.0
         self.last_beep_idx = -1
         
     def get_point_on_path(self, path, progress, k):
@@ -2392,7 +2484,6 @@ class PresenterLadderDialog(QDialog):
         layout.setContentsMargins(40, 30, 40, 30)
         layout.setAlignment(Qt.AlignCenter)
         
-        # 메인 카드 프레임
         self.frame = QFrame()
         self.frame.setStyleSheet("""
             QFrame#LadderMainFrame {
@@ -2407,7 +2498,6 @@ class PresenterLadderDialog(QDialog):
         frame_layout.setContentsMargins(30, 25, 30, 25)
         frame_layout.setSpacing(15)
         
-        # 헤더 바
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_lbl = QLabel("🪜 오늘의 발표자 사다리 타기 🎯")
@@ -2436,7 +2526,6 @@ class PresenterLadderDialog(QDialog):
         
         frame_layout.addLayout(header)
         
-        # 중앙 사다리 캔버스
         if self.num_cols > 1:
             self.canvas = LadderCanvasWidget(self)
             frame_layout.addWidget(self.canvas, stretch=1)
@@ -2447,7 +2536,6 @@ class PresenterLadderDialog(QDialog):
             single_box.setAlignment(Qt.AlignCenter)
             frame_layout.addWidget(single_box, stretch=1)
         
-        # 하단 조작 버튼 바
         btn_bar = QHBoxLayout()
         btn_bar.setSpacing(15)
         btn_bar.setAlignment(Qt.AlignCenter)
@@ -2516,7 +2604,6 @@ class PresenterLadderDialog(QDialog):
         frame_layout.addLayout(btn_bar)
         layout.addWidget(self.frame)
         
-        # 애니메이션 타이머
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_animation)
         
@@ -2552,27 +2639,63 @@ class PresenterLadderDialog(QDialog):
             
         self.is_running = True
         self.is_finished = False
-        self.is_blind = False  # 사다리 타기 시작 시 가림막 해제
+        self.is_blind = False
         if hasattr(self, 'blind_btn'):
             self.blind_btn.setText("🙈 사다리 가리기")
+            
+        self.progresses = [0.0] * self.num_cols
+        self.base_speeds = [random.uniform(0.0067, 0.0074) for _ in range(self.num_cols)]
+        self.speeds = list(self.base_speeds)
+        self.finished_students = [False] * self.num_cols
+        self.slot_results = [None] * self.num_cols
+        self.first_winner_revealed = False
         self.progress = 0.0
+        self.last_beep_idx = -1
+        
         self.start_btn.setEnabled(False)
         self.start_btn.setText("사다리 타는 중... 🪜")
-        self.sub_lbl.setText("과연 사다리를 타고 내려와 발표자가 될 행운의 주인공은 누구일까요?")
-        self.sub_lbl.setStyleSheet("color: #94A3B8; font-size: 13px; background: transparent; border: none;")
+        self.sub_lbl.setText("과연 누가 먼저 내려올까요? 먼저 내려온 친구부터 결과가 즉시 공개됩니다! 🏁")
+        self.sub_lbl.setStyleSheet("color: #60A5FA; font-size: 14px; font-weight: bold; background: transparent; border: none;")
         self.timer.start(30)
         
     def update_animation(self):
-        self.progress += 0.007
+        any_finished_this_frame = False
+        winner_just_arrived = False
         
-        # 사다리 타는 동안 긴장감 비프음
-        step_idx = int(self.progress * 15)
-        if step_idx > self.last_beep_idx:
-            self.last_beep_idx = step_idx
+        for k in range(self.num_cols):
+            if not self.finished_students[k]:
+                jitter = random.uniform(-0.00006, 0.00006)
+                self.speeds[k] = max(0.0063, min(0.0076, self.speeds[k] + jitter))
+                self.progresses[k] += self.speeds[k]
+                
+                if self.progresses[k] >= 1.0:
+                    self.progresses[k] = 1.0
+                    self.finished_students[k] = True
+                    any_finished_this_frame = True
+                    
+                    dest_col = int(round(self.paths[k][-1][0]))
+                    is_win = (dest_col == self.win_slot)
+                    cand = self.pool[k]
+                    self.slot_results[dest_col] = {
+                        'cand': cand,
+                        'is_winner': is_win,
+                        'student_idx': k
+                    }
+                    
+                    if is_win:
+                        winner_just_arrived = True
+                        self.first_winner_revealed = True
+                        
+        self.progress = max(self.progresses) if self.progresses else 0.0
+        
+        if any_finished_this_frame:
             QApplication.beep()
             
-        if self.progress >= 1.0:
-            self.progress = 1.0
+        if winner_just_arrived:
+            self.sub_lbl.setText(f"🎯 [ {self.winner['name']} ] 학생이 발표자 슬롯에 도착했습니다!! 👑")
+            self.sub_lbl.setStyleSheet("color: #FBBF24; font-size: 15px; font-weight: bold; background: transparent; border: none;")
+            
+        if all(self.finished_students):
             self.timer.stop()
             self.is_running = False
             self.is_finished = True
@@ -2594,9 +2717,20 @@ class PresenterLadderDialog(QDialog):
         self.timer.stop()
         self.is_running = False
         self.is_finished = True
-        self.is_blind = False  # 결과 보기 시 가림막 해제
+        self.is_blind = False
         if hasattr(self, 'blind_btn'):
             self.blind_btn.setText("🙈 사다리 가리기")
+            
+        for k in range(self.num_cols):
+            self.progresses[k] = 1.0
+            self.finished_students[k] = True
+            dest_col = int(round(self.paths[k][-1][0]))
+            self.slot_results[dest_col] = {
+                'cand': self.pool[k],
+                'is_winner': (dest_col == self.win_slot),
+                'student_idx': k
+            }
+            
         self.progress = 1.0
         self.start_btn.setEnabled(True)
         self.start_btn.setText("▶️ 다시 타기")
@@ -2614,10 +2748,9 @@ class PresenterLadderDialog(QDialog):
             self.player.stop()
         self.is_running = False
         self.is_finished = False
-        self.is_blind = True  # 사다리 재설정 시 다시 가림막 활성화
+        self.is_blind = True
         if hasattr(self, 'blind_btn'):
             self.blind_btn.setText("👀 사다리 미리보기")
-        self.progress = 0.0
         self.start_btn.setEnabled(True)
         self.start_btn.setText("▶️  사다리 타기 시작!")
         self.sub_lbl.setText("과연 사다리를 타고 내려와 발표자가 될 행운의 주인공은 누구일까요?")
@@ -3989,6 +4122,741 @@ class StudentItemWidget(QWidget):
 
 
 
+class StudentEditDialog(QDialog):
+    def __init__(self, parent=None, student_data=None, class_list=None):
+        super().__init__(parent)
+        self.student_data = student_data or {}
+        self.class_list = class_list or []
+        self.selected_photo_path = ""
+        self.base_dir = parent.base_dir if parent else os.path.dirname(os.path.abspath(__file__))
+        self.initUI()
+
+    def initUI(self):
+        is_edit = bool(self.student_data)
+        self.setWindowTitle("학생 정보 수정" if is_edit else "새 학생 등록")
+        self.setFixedSize(460, 520)
+        self.setStyleSheet("""
+            QDialog { background-color: #F8FAFC; border-radius: 16px; }
+            QLabel { font-family: 'Malgun Gothic'; color: #334155; font-size: 13px; font-weight: bold; }
+            QLineEdit, QComboBox {
+                background-color: white; border: 1.5px solid #CBD5E1; border-radius: 10px;
+                padding: 10px 14px; font-size: 14px; font-family: 'Malgun Gothic';
+            }
+            QLineEdit:focus, QComboBox:focus { border: 2px solid #3B82F6; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+
+        title = QLabel("✏️ 학생 정보 수정" if is_edit else "➕ 새 학생 등록")
+        title.setFont(QFont('Malgun Gothic', 16, QFont.Bold))
+        title.setStyleSheet("color: #0F172A; border: none;")
+        layout.addWidget(title)
+
+        # Photo section
+        photo_row = QHBoxLayout()
+        self.photo_preview = QLabel("사진 없음")
+        self.photo_preview.setFixedSize(100, 120)
+        self.photo_preview.setAlignment(Qt.AlignCenter)
+        self.photo_preview.setStyleSheet("""
+            QLabel { background-color: white; border: 2px dashed #94A3B8; border-radius: 12px; color: #94A3B8; font-size: 12px; }
+        """)
+
+        photo_btn_box = QVBoxLayout()
+        photo_btn_box.setSpacing(8)
+        photo_desc = QLabel("프로필 사진")
+        photo_desc.setStyleSheet("color: #64748B; font-size: 12px;")
+
+        self.select_photo_btn = QPushButton("📁 사진 선택...")
+        self.select_photo_btn.setCursor(Qt.PointingHandCursor)
+        self.select_photo_btn.setStyleSheet("""
+            QPushButton { background-color: #EEF2FF; color: #4F46E5; font-weight: bold; border: 1.5px solid #C7D2FE; border-radius: 8px; padding: 8px 14px; }
+            QPushButton:hover { background-color: #E0E7FF; }
+        """)
+        self.select_photo_btn.clicked.connect(self.choose_photo)
+
+        self.remove_photo_btn = QPushButton("삭제")
+        self.remove_photo_btn.setCursor(Qt.PointingHandCursor)
+        self.remove_photo_btn.setStyleSheet("""
+            QPushButton { background-color: #F1F5F9; color: #64748B; border: 1px solid #CBD5E1; border-radius: 8px; padding: 6px 12px; }
+            QPushButton:hover { background-color: #E2E8F0; color: #DC2626; }
+        """)
+        self.remove_photo_btn.clicked.connect(self.clear_photo)
+
+        photo_btn_box.addWidget(photo_desc)
+        photo_btn_box.addWidget(self.select_photo_btn)
+        photo_btn_box.addWidget(self.remove_photo_btn)
+        photo_btn_box.addStretch()
+
+        photo_row.addWidget(self.photo_preview)
+        photo_row.addSpacing(16)
+        photo_row.addLayout(photo_btn_box)
+        photo_row.addStretch()
+        layout.addLayout(photo_row)
+
+        # Fields
+        form_layout = QVBoxLayout()
+        form_layout.setSpacing(12)
+
+        lbl_id = QLabel("학번 / 번호 (입력키) *")
+        self.id_input = QLineEdit()
+        self.id_input.setPlaceholderText("예: 10101, 932407 등")
+        if is_edit:
+            self.id_input.setEnabled(False)
+            self.id_input.setStyleSheet("background-color: #F1F5F9; color: #64748B; border: 1.5px solid #E2E8F0;")
+        form_layout.addWidget(lbl_id)
+        form_layout.addWidget(self.id_input)
+
+        lbl_name = QLabel("이름 *")
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("학생 이름을 입력하세요")
+        form_layout.addWidget(lbl_name)
+        form_layout.addWidget(self.name_input)
+
+        lbl_class = QLabel("학년 / 반 *")
+        self.class_input = QComboBox()
+        self.class_input.setEditable(True)
+        self.class_input.addItems(self.class_list)
+        self.class_input.lineEdit().setPlaceholderText("예: 1학년 3반")
+        form_layout.addWidget(lbl_class)
+        form_layout.addWidget(self.class_input)
+
+        layout.addLayout(form_layout)
+        layout.addStretch()
+
+        # Bottom buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self.cancel_btn = QPushButton("취소")
+        self.cancel_btn.setFixedHeight(44)
+        self.cancel_btn.setCursor(Qt.PointingHandCursor)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton { background-color: #E2E8F0; color: #475569; font-weight: bold; border-radius: 10px; border: none; font-size: 13px; }
+            QPushButton:hover { background-color: #CBD5E1; }
+        """)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.save_btn = QPushButton("저장 완료")
+        self.save_btn.setFixedHeight(44)
+        self.save_btn.setCursor(Qt.PointingHandCursor)
+        self.save_btn.setStyleSheet("""
+            QPushButton { background-color: #3B82F6; color: white; font-weight: bold; border-radius: 10px; border: none; font-size: 13px; }
+            QPushButton:hover { background-color: #2563EB; }
+        """)
+        self.save_btn.clicked.connect(self.save)
+
+        btn_row.addWidget(self.cancel_btn, 1)
+        btn_row.addWidget(self.save_btn, 2)
+        layout.addLayout(btn_row)
+
+        # Load initial values
+        if is_edit:
+            s_id = self.student_data.get('id', '')
+            self.id_input.setText(s_id)
+            self.name_input.setText(self.student_data.get('name', ''))
+            cls = self.student_data.get('class', '')
+            idx = self.class_input.findText(cls)
+            if idx >= 0:
+                self.class_input.setCurrentIndex(idx)
+            else:
+                self.class_input.setEditText(cls)
+            
+            pic_fn = self.student_data.get('photo', '')
+            if pic_fn:
+                p_path = os.path.join(self.base_dir, 'photos', pic_fn)
+                if os.path.exists(p_path):
+                    self.set_preview_image(p_path)
+                    self.selected_photo_path = p_path
+
+    def choose_photo(self):
+        fpath, _ = QFileDialog.getOpenFileName(self, "학생 사진 선택", "", "이미지 파일 (*.png *.jpg *.jpeg *.bmp)")
+        if fpath:
+            self.selected_photo_path = fpath
+            self.set_preview_image(fpath)
+
+    def clear_photo(self):
+        self.selected_photo_path = ""
+        self.photo_preview.clear()
+        self.photo_preview.setText("사진 없음")
+
+    def set_preview_image(self, path):
+        pix = QPixmap(path)
+        if not pix.isNull():
+            self.photo_preview.setPixmap(pix.scaled(self.photo_preview.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+            self.photo_preview.setStyleSheet("border-radius: 12px; border: 2px solid #3B82F6;")
+
+    def save(self):
+        s_id = self.id_input.text().strip()
+        s_name = self.name_input.text().strip()
+        s_class = self.class_input.currentText().strip()
+
+        if not s_id:
+            QMessageBox.warning(self, "경고", "학번(번호)을 입력해 주세요.")
+            self.id_input.setFocus()
+            return
+        if not s_name:
+            QMessageBox.warning(self, "경고", "학생 이름을 입력해 주세요.")
+            self.name_input.setFocus()
+            return
+        if not s_class:
+            QMessageBox.warning(self, "경고", "학년/반 정보를 입력해 주세요.")
+            self.class_input.setFocus()
+            return
+
+        self.result_data = {
+            'id': s_id,
+            'name': s_name,
+            'class': s_class,
+            'photo_path': self.selected_photo_path
+        }
+        self.accept()
+
+
+class StudentManagementDialog(QDialog):
+    def __init__(self, main_app):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.base_dir = main_app.base_dir
+        self.current_student_id = None
+        self.initUI()
+        self.load_students_list()
+
+    def initUI(self):
+        self.setWindowTitle("👥 스마트 출결 - 학생 관리 시스템")
+        self.resize(1080, 700)
+        self.setMinimumSize(960, 620)
+        self.setStyleSheet("""
+            QDialog { background-color: #F8FAFC; }
+            QLabel { font-family: 'Malgun Gothic'; color: #1E293B; }
+            QLineEdit, QComboBox {
+                background-color: white; border: 1.5px solid #CBD5E1; border-radius: 10px;
+                padding: 8px 12px; font-size: 13px; font-family: 'Malgun Gothic';
+            }
+            QLineEdit:focus, QComboBox:focus { border: 2px solid #3B82F6; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(14)
+
+        # Top Bar
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(12)
+
+        title_lbl = QLabel("👥 학생 관리")
+        title_lbl.setFont(QFont('Malgun Gothic', 16, QFont.Bold))
+        title_lbl.setStyleSheet("color: #0F172A;")
+
+        self.class_filter = QComboBox()
+        self.class_filter.setFixedWidth(160)
+        self.class_filter.addItem("전체 학급")
+        for cls in self.main_app.get_class_list():
+            self.class_filter.addItem(cls)
+        self.class_filter.currentTextChanged.connect(self.filter_students)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 이름 또는 학번 검색...")
+        self.search_input.setFixedWidth(220)
+        self.search_input.textChanged.connect(self.filter_students)
+
+        self.count_lbl = QLabel("총 0명")
+        self.count_lbl.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.count_lbl.setStyleSheet("color: #64748B; padding: 4px 10px; background-color: #F1F5F9; border-radius: 8px;")
+
+        self.add_student_btn = QPushButton("➕ 새 학생 등록")
+        self.add_student_btn.setFixedHeight(38)
+        self.add_student_btn.setCursor(Qt.PointingHandCursor)
+        self.add_student_btn.setStyleSheet("""
+            QPushButton { background-color: #3B82F6; color: white; font-weight: bold; border-radius: 9px; padding: 0 16px; font-size: 13px; border: none; }
+            QPushButton:hover { background-color: #2563EB; }
+        """)
+        self.add_student_btn.clicked.connect(self.open_add_student_dialog)
+
+        top_bar.addWidget(title_lbl)
+        top_bar.addSpacing(10)
+        top_bar.addWidget(self.class_filter)
+        top_bar.addWidget(self.search_input)
+        top_bar.addWidget(self.count_lbl)
+        top_bar.addStretch()
+        top_bar.addWidget(self.add_student_btn)
+        layout.addLayout(top_bar)
+
+        # Splitter Body
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setStyleSheet("""
+            QSplitter::handle { background-color: #E2E8F0; width: 2px; }
+        """)
+
+        # Left Panel (Table)
+        left_widget = QWidget()
+        left_vbox = QVBoxLayout(left_widget)
+        left_vbox.setContentsMargins(0, 0, 10, 0)
+        left_vbox.setSpacing(8)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["학번", "이름", "학년/반", "MVP"])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: white; border: 1px solid #E2E8F0; border-radius: 12px;
+                font-family: 'Malgun Gothic'; font-size: 13px; outline: none;
+            }
+            QTableWidget::item { padding: 8px; border-bottom: 1px solid #F1F5F9; }
+            QTableWidget::item:selected { background-color: #EFF6FF; color: #1E40AF; font-weight: bold; }
+            QHeaderView::section {
+                background-color: #F8FAFC; color: #475569; font-weight: bold; border: none;
+                border-bottom: 2px solid #E2E8F0; padding: 8px; font-size: 12px;
+            }
+        """)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self.on_student_selected)
+        left_vbox.addWidget(self.table)
+
+        # Right Panel (Details)
+        right_widget = QWidget()
+        right_vbox = QVBoxLayout(right_widget)
+        right_vbox.setContentsMargins(10, 0, 0, 0)
+        right_vbox.setSpacing(12)
+
+        # Profile Card
+        self.profile_card = QFrame()
+        self.profile_card.setStyleSheet("""
+            QFrame { background-color: white; border: 1px solid #E2E8F0; border-radius: 14px; }
+        """)
+        pcard_layout = QHBoxLayout(self.profile_card)
+        pcard_layout.setContentsMargins(18, 14, 18, 14)
+        pcard_layout.setSpacing(16)
+
+        self.detail_photo = QLabel("사진")
+        self.detail_photo.setFixedSize(85, 105)
+        self.detail_photo.setAlignment(Qt.AlignCenter)
+        self.detail_photo.setStyleSheet("background-color: #F8FAFC; border: 1.5px solid #E2E8F0; border-radius: 10px; color: #94A3B8;")
+
+        info_box = QVBoxLayout()
+        info_box.setSpacing(4)
+        self.detail_name = QLabel("학생을 선택하세요")
+        self.detail_name.setFont(QFont('Malgun Gothic', 16, QFont.Bold))
+        self.detail_name.setStyleSheet("color: #0F172A; border: none;")
+
+        self.detail_id = QLabel("학번: -")
+        self.detail_id.setFont(QFont('Malgun Gothic', 12))
+        self.detail_id.setStyleSheet("color: #64748B; border: none;")
+
+        self.detail_class = QLabel("학급: -")
+        self.detail_class.setFont(QFont('Malgun Gothic', 12))
+        self.detail_class.setStyleSheet("color: #64748B; border: none;")
+
+        info_box.addWidget(self.detail_name)
+        info_box.addWidget(self.detail_id)
+        info_box.addWidget(self.detail_class)
+        info_box.addStretch()
+
+        btn_box = QVBoxLayout()
+        btn_box.setSpacing(8)
+        self.edit_btn = QPushButton("✏️ 정보 수정")
+        self.edit_btn.setFixedHeight(34)
+        self.edit_btn.setCursor(Qt.PointingHandCursor)
+        self.edit_btn.setStyleSheet("""
+            QPushButton { background-color: #EEF2FF; color: #4F46E5; font-weight: bold; border-radius: 8px; border: 1px solid #C7D2FE; padding: 0 12px; font-size: 12px; }
+            QPushButton:hover { background-color: #E0E7FF; }
+        """)
+        self.edit_btn.clicked.connect(self.edit_selected_student)
+
+        self.delete_btn = QPushButton("🗑️ 삭제")
+        self.delete_btn.setFixedHeight(34)
+        self.delete_btn.setCursor(Qt.PointingHandCursor)
+        self.delete_btn.setStyleSheet("""
+            QPushButton { background-color: #FEE2E2; color: #DC2626; font-weight: bold; border-radius: 8px; border: 1px solid #FECACA; padding: 0 12px; font-size: 12px; }
+            QPushButton:hover { background-color: #FCA5A5; color: white; }
+        """)
+        self.delete_btn.clicked.connect(self.delete_selected_student)
+
+        btn_box.addWidget(self.edit_btn)
+        btn_box.addWidget(self.delete_btn)
+        btn_box.addStretch()
+
+        pcard_layout.addWidget(self.detail_photo)
+        pcard_layout.addLayout(info_box, stretch=1)
+        pcard_layout.addLayout(btn_box)
+
+        right_vbox.addWidget(self.profile_card)
+
+        # Tab Widget for Attendance / MVP
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #E2E8F0; border-radius: 12px; background: white; }
+            QTabBar::tab {
+                background: #F1F5F9; color: #64748B; padding: 8px 18px; font-weight: bold;
+                border-top-left-radius: 8px; border-top-right-radius: 8px; font-size: 12px;
+            }
+            QTabBar::tab:selected { background: white; color: #2563EB; border-bottom: 2px solid #2563EB; }
+        """)
+
+        # Tab 1: Attendance
+        tab_att = QWidget()
+        tab_att_layout = QVBoxLayout(tab_att)
+        tab_att_layout.setContentsMargins(12, 12, 12, 12)
+        tab_att_layout.setSpacing(8)
+
+        self.att_summary_lbl = QLabel("출석 0회 | 학교 결석 0회 | 수업 결석 0회")
+        self.att_summary_lbl.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.att_summary_lbl.setStyleSheet("color: #0369A1; background-color: #E0F2FE; border-radius: 8px; padding: 6px 12px;")
+        tab_att_layout.addWidget(self.att_summary_lbl)
+
+        self.att_table = QTableWidget()
+        self.att_table.setColumnCount(4)
+        self.att_table.setHorizontalHeaderLabels(["일시", "상태", "기분/감정", "사유/내용"])
+        self.att_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.att_table.setShowGrid(False)
+        self.att_table.verticalHeader().setVisible(False)
+        self.att_table.setStyleSheet("""
+            QTableWidget { border: none; font-size: 12px; font-family: 'Malgun Gothic'; }
+            QTableWidget::item { padding: 6px; border-bottom: 1px solid #F1F5F9; }
+            QHeaderView::section { background-color: #F8FAFC; color: #64748B; font-weight: bold; border: none; padding: 6px; }
+        """)
+        self.att_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.att_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.att_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.att_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        tab_att_layout.addWidget(self.att_table)
+
+        # Tab 2: MVP
+        tab_mvp = QWidget()
+        tab_mvp_layout = QVBoxLayout(tab_mvp)
+        tab_mvp_layout.setContentsMargins(12, 12, 12, 12)
+        tab_mvp_layout.setSpacing(8)
+
+        self.mvp_summary_lbl = QLabel("🌟 총 0회 선정")
+        self.mvp_summary_lbl.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.mvp_summary_lbl.setStyleSheet("color: #92400E; background-color: #FEF3C7; border-radius: 8px; padding: 6px 12px;")
+        tab_mvp_layout.addWidget(self.mvp_summary_lbl)
+
+        self.mvp_table = QTableWidget()
+        self.mvp_table.setColumnCount(2)
+        self.mvp_table.setHorizontalHeaderLabels(["선정 일시", "내용"])
+        self.mvp_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.mvp_table.setShowGrid(False)
+        self.mvp_table.verticalHeader().setVisible(False)
+        self.mvp_table.setStyleSheet("""
+            QTableWidget { border: none; font-size: 12px; font-family: 'Malgun Gothic'; }
+            QTableWidget::item { padding: 6px; border-bottom: 1px solid #F1F5F9; }
+            QHeaderView::section { background-color: #F8FAFC; color: #64748B; font-weight: bold; border: none; padding: 6px; }
+        """)
+        self.mvp_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.mvp_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        tab_mvp_layout.addWidget(self.mvp_table)
+
+        self.tabs.addTab(tab_att, "🗓️ 출결 내역")
+        self.tabs.addTab(tab_mvp, "🌟 MVP 기록")
+        right_vbox.addWidget(self.tabs, stretch=1)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([420, 620])
+        layout.addWidget(splitter, stretch=1)
+
+    def load_mvp_counts(self):
+        counts = {}
+        if os.path.exists(self.main_app.mvp_file):
+            try:
+                with open(self.main_app.mvp_file, 'r', encoding='utf-8-sig') as f:
+                    r = csv.reader(f)
+                    next(r, None)
+                    for row in r:
+                        if len(row) >= 2:
+                            s_id = row[1]
+                            counts[s_id] = counts.get(s_id, 0) + 1
+            except Exception:
+                pass
+        return counts
+
+    def load_students_list(self):
+        mvp_counts = self.load_mvp_counts()
+        self.all_students = []
+        for s_id, s_info in self.main_app.students_data.items():
+            s_name = s_info.get('이름', '')
+            cls_val = s_info.get('학생정보', '') or s_info.get('학년반', '')
+            if not cls_val:
+                for k, v in s_info.items():
+                    if ('학년' in k or '반' in k or '정보' in k) and ('번호' not in k and '학번' not in k):
+                        cls_val = str(v).split('\n')[0].strip()
+                        break
+            else:
+                cls_val = str(cls_val).split('\n')[0].strip()
+            pic_k = next((k for k in s_info.keys() if '사진' in k), None)
+            photo_fn = s_info.get(pic_k, '') if pic_k else ''
+            mvp_cnt = mvp_counts.get(s_id, 0)
+            self.all_students.append({
+                'id': s_id,
+                'name': s_name,
+                'class': cls_val,
+                'photo': photo_fn,
+                'mvp': mvp_cnt,
+                'raw': s_info
+            })
+
+        self.all_students.sort(key=lambda x: (x['class'], x['id']))
+        self.filter_students()
+
+    def filter_students(self):
+        selected_cls = self.class_filter.currentText()
+        query = self.search_input.text().strip().lower()
+
+        filtered = []
+        for s in self.all_students:
+            if selected_cls != "전체 학급" and selected_cls not in s['class']:
+                continue
+            if query and (query not in s['id'].lower() and query not in s['name'].lower()):
+                continue
+            filtered.append(s)
+
+        self.count_lbl.setText(f"총 {len(filtered)}명")
+        self.table.setRowCount(len(filtered))
+        for row_idx, s in enumerate(filtered):
+            item_id = QTableWidgetItem(s['id'])
+            item_id.setTextAlignment(Qt.AlignCenter)
+            item_name = QTableWidgetItem(s['name'])
+            item_name.setTextAlignment(Qt.AlignCenter)
+            item_cls = QTableWidgetItem(s['class'])
+            item_mvp = QTableWidgetItem(f"⭐ {s['mvp']}" if s['mvp'] > 0 else "-")
+            item_mvp.setTextAlignment(Qt.AlignCenter)
+
+            item_id.setData(Qt.UserRole, s['id'])
+
+            self.table.setItem(row_idx, 0, item_id)
+            self.table.setItem(row_idx, 1, item_name)
+            self.table.setItem(row_idx, 2, item_cls)
+            self.table.setItem(row_idx, 3, item_mvp)
+
+        if filtered:
+            self.table.selectRow(0)
+        else:
+            self.clear_detail()
+
+    def on_student_selected(self):
+        selected_rows = self.table.selectedItems()
+        if not selected_rows:
+            return
+        row = selected_rows[0].row()
+        item_id = self.table.item(row, 0)
+        if not item_id:
+            return
+        s_id = item_id.data(Qt.UserRole)
+        self.display_student_detail(s_id)
+
+    def display_student_detail(self, s_id):
+        self.current_student_id = s_id
+        student = next((s for s in self.all_students if s['id'] == s_id), None)
+        if not student:
+            return
+
+        self.detail_name.setText(student['name'])
+        self.detail_id.setText(f"학번: {student['id']}")
+        self.detail_class.setText(f"학급: {student['class']}")
+
+        pic_fn = student['photo']
+        p_path = os.path.join(self.base_dir, 'photos', pic_fn) if pic_fn else ''
+        if p_path and os.path.exists(p_path):
+            pix = QPixmap(p_path)
+            self.detail_photo.setPixmap(pix.scaled(self.detail_photo.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+            self.detail_photo.setStyleSheet("border-radius: 10px; border: 1.5px solid #CBD5E1;")
+        else:
+            self.detail_photo.clear()
+            self.detail_photo.setText("사진 없음")
+            self.detail_photo.setStyleSheet("background-color: #F8FAFC; border: 1.5px solid #E2E8F0; border-radius: 10px; color: #94A3B8;")
+
+        # Attendance data
+        att_rows = []
+        att_cnt = 0
+        school_abs_cnt = 0
+        class_abs_cnt = 0
+        if os.path.exists(self.main_app.log_file):
+            try:
+                with open(self.main_app.log_file, 'r', encoding='utf-8-sig') as f:
+                    r = csv.reader(f)
+                    next(r, None)
+                    for row in r:
+                        if len(row) >= 4 and row[1] == s_id:
+                            time_s = row[0]
+                            st = row[3]
+                            emo = row[4] if len(row) >= 5 else ''
+                            if st == '출석':
+                                att_cnt += 1
+                            elif st == '학교 결석':
+                                school_abs_cnt += 1
+                            elif st == '수업 결석':
+                                class_abs_cnt += 1
+                            att_rows.append((time_s, st, emo, ""))
+            except Exception:
+                pass
+
+        # Absences reasons
+        if os.path.exists(self.main_app.absence_file):
+            try:
+                with open(self.main_app.absence_file, 'r', encoding='utf-8-sig') as f:
+                    r = csv.reader(f)
+                    next(r, None)
+                    for row in r:
+                        if len(row) >= 4 and row[1] == s_id:
+                            date_s, abs_type, reason = row[0], row[2], row[3]
+                            att_rows.append((date_s, abs_type, "", f"사유: {reason}"))
+            except Exception:
+                pass
+
+        att_rows.sort(key=lambda x: x[0], reverse=True)
+        self.att_summary_lbl.setText(f"출석 {att_cnt}회 | 학교 결석 {school_abs_cnt}회 | 수업 결석 {class_abs_cnt}회")
+        self.att_table.setRowCount(len(att_rows))
+        for idx, (dt, st, emo, note) in enumerate(att_rows):
+            i_dt = QTableWidgetItem(dt)
+            i_st = QTableWidgetItem(st)
+            i_emo = QTableWidgetItem(emo)
+            i_note = QTableWidgetItem(note)
+            if '결석' in st:
+                i_st.setForeground(QColor("#DC2626"))
+            elif st == '출석':
+                i_st.setForeground(QColor("#059669"))
+            self.att_table.setItem(idx, 0, i_dt)
+            self.att_table.setItem(idx, 1, i_st)
+            self.att_table.setItem(idx, 2, i_emo)
+            self.att_table.setItem(idx, 3, i_note)
+
+        # MVP data
+        mvp_rows = []
+        if os.path.exists(self.main_app.mvp_file):
+            try:
+                with open(self.main_app.mvp_file, 'r', encoding='utf-8-sig') as f:
+                    r = csv.reader(f)
+                    next(r, None)
+                    for row in r:
+                        if len(row) >= 2 and row[1] == s_id:
+                            dt = row[0]
+                            reason = row[3] if len(row) >= 4 else "오늘의 MVP 선정"
+                            mvp_rows.append((dt, reason))
+            except Exception:
+                pass
+
+        mvp_rows.sort(key=lambda x: x[0], reverse=True)
+        self.mvp_summary_lbl.setText(f"🌟 총 {len(mvp_rows)}회 선정")
+        self.mvp_table.setRowCount(len(mvp_rows))
+        for idx, (dt, reason) in enumerate(mvp_rows):
+            i_dt = QTableWidgetItem(dt)
+            i_rs = QTableWidgetItem(reason)
+            self.mvp_table.setItem(idx, 0, i_dt)
+            self.mvp_table.setItem(idx, 1, i_rs)
+
+    def clear_detail(self):
+        self.current_student_id = None
+        self.detail_name.setText("학생을 선택하세요")
+        self.detail_id.setText("학번: -")
+        self.detail_class.setText("학급: -")
+        self.detail_photo.clear()
+        self.detail_photo.setText("사진 없음")
+        self.att_table.setRowCount(0)
+        self.mvp_table.setRowCount(0)
+        self.att_summary_lbl.setText("출석 0회 | 학교 결석 0회 | 수업 결석 0회")
+        self.mvp_summary_lbl.setText("🌟 총 0회 선정")
+
+    def open_add_student_dialog(self):
+        classes = self.main_app.get_class_list()
+        dlg = StudentEditDialog(self, student_data=None, class_list=classes)
+        if dlg.exec_() == QDialog.Accepted:
+            data = dlg.result_data
+            s_id = data['id']
+            s_name = data['name']
+            if s_id in self.main_app.students_data:
+                QMessageBox.warning(self, "경고", f"이미 등록되어 있는 학번입니다 ({s_id}).")
+                return
+
+            pic_filename = ""
+            if data['photo_path'] and os.path.exists(data['photo_path']):
+                ext = os.path.splitext(data['photo_path'])[1].lower() or '.jpg'
+                pic_filename = f"{s_name}{ext}"
+                dest = os.path.join(self.base_dir, 'photos', pic_filename)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                try:
+                    if os.path.abspath(data['photo_path']) != os.path.abspath(dest):
+                        shutil.copy2(data['photo_path'], dest)
+                except Exception as e:
+                    print("Photo copy error:", e)
+
+            # Add to main_app
+            self.main_app.students_data[s_id] = {
+                '학년반번호': s_id,
+                '이름': s_name,
+                '학생정보': data['class'],
+                '사진파일명': pic_filename
+            }
+            self.main_app.save_students_data()
+            self.load_students_list()
+            self.main_app.refresh_list()
+            QMessageBox.information(self, "완료", f"[{s_name}] 학생이 성공적으로 등록되었습니다.")
+
+    def edit_selected_student(self):
+        if not self.current_student_id:
+            return
+        student = next((s for s in self.all_students if s['id'] == self.current_student_id), None)
+        if not student:
+            return
+
+        classes = self.main_app.get_class_list()
+        dlg = StudentEditDialog(self, student_data=student, class_list=classes)
+        if dlg.exec_() == QDialog.Accepted:
+            data = dlg.result_data
+            s_id = student['id']
+            s_name = data['name']
+
+            pic_filename = student['photo']
+            if data['photo_path'] and os.path.exists(data['photo_path']) and data['photo_path'] != os.path.join(self.base_dir, 'photos', pic_filename):
+                ext = os.path.splitext(data['photo_path'])[1].lower() or '.jpg'
+                pic_filename = f"{s_name}{ext}"
+                dest = os.path.join(self.base_dir, 'photos', pic_filename)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                try:
+                    shutil.copy2(data['photo_path'], dest)
+                except Exception as e:
+                    print("Photo copy error:", e)
+            elif not data['photo_path']:
+                pic_filename = ""
+
+            orig = self.main_app.students_data.get(s_id, {})
+            orig['이름'] = s_name
+            orig['학생정보'] = data['class']
+            orig['사진파일명'] = pic_filename
+            self.main_app.students_data[s_id] = orig
+            self.main_app.save_students_data()
+            self.load_students_list()
+            self.main_app.refresh_list()
+            QMessageBox.information(self, "완료", f"[{data['name']}] 학생 정보가 수정되었습니다.")
+
+    def delete_selected_student(self):
+        if not self.current_student_id:
+            return
+        student = next((s for s in self.all_students if s['id'] == self.current_student_id), None)
+        if not student:
+            return
+
+        res = QMessageBox.question(self, "학생 삭제", f"정말로 [{student['name']}] 학생을 명단에서 삭제하시겠습니까?\n(기존 출결 및 MVP 로그는 보존됩니다.)", QMessageBox.Yes | QMessageBox.No)
+        if res == QMessageBox.Yes:
+            s_id = student['id']
+            if s_id in self.main_app.students_data:
+                del self.main_app.students_data[s_id]
+            if s_id in self.main_app.active_students:
+                del self.main_app.active_students[s_id]
+            self.main_app.save_students_data()
+            self.load_students_list()
+            self.main_app.refresh_list()
+            QMessageBox.information(self, "완료", "학생이 삭제되었습니다.")
+
+
 class StudentAttendanceApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -4017,18 +4885,24 @@ class StudentAttendanceApp(QWidget):
         import re
         class_set = set()
         for s in self.students_data.values():
-            class_val = ""
-            for k, v in s.items():
-                if '학년' in k or '반' in k or '정보' in k:
-                    class_val = str(v).split('\n')[0].strip()
-                    break
+            # 1. '학생정보' 또는 '학년반' 컬럼을 우선적으로 읽음 ('학년반번호' 컬럼이 오인되는 것 방지)
+            class_val = s.get('학생정보', '') or s.get('학년반', '')
+            if not class_val:
+                for k, v in s.items():
+                    if ('학년' in k or '반' in k or '정보' in k) and ('번호' not in k and '학번' not in k):
+                        class_val = str(v).split('\n')[0].strip()
+                        break
+            else:
+                class_val = str(class_val).split('\n')[0].strip()
+
             if class_val:
                 m = re.search(r'(\d+학년\s*\d+반)', class_val)
                 if m:
                     class_set.add(m.group(1))
-                else:
-                    val = re.sub(r'\s*\d+번.*$', '', class_val)
-                    class_set.add(val)
+                elif not class_val.isdigit():
+                    val = re.sub(r'\s*\d+번.*$', '', class_val).strip()
+                    if val:
+                        class_set.add(val)
         return sorted(list(class_set))
 
     def show_start_class_selector(self):
@@ -4042,10 +4916,15 @@ class StudentAttendanceApp(QWidget):
 
 
     def load_data(self):
-        # 만약 기존 members.csv만 있고 students.csv가 없다면 (이전 테스트용 환경 고려)
+        # students.csv를 기본/우선으로 사용, 없을 경우 members.csv 호환
+        students_path = os.path.join(self.base_dir, 'students.csv')
         members_path = os.path.join(self.base_dir, 'members.csv')
-        if not os.path.exists(self.csv_path) and os.path.exists(members_path):
+        if os.path.exists(students_path):
+            self.csv_path = students_path
+        elif os.path.exists(members_path):
             self.csv_path = members_path
+        else:
+            self.csv_path = students_path
             
         if not os.path.exists(self.csv_path):
             with open(self.csv_path, 'w', encoding='utf-8-sig', newline='') as f:
@@ -4088,34 +4967,31 @@ class StudentAttendanceApp(QWidget):
         """)
         
         main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(30)
+        main_layout.setContentsMargins(18, 12, 18, 12)
+        main_layout.setSpacing(16)
         
         # ==========================================
         # 1. 왼쪽 패널 (사이드바)
         # ==========================================
         left_panel = QFrame()
-        left_panel.setFixedWidth(340)
+        left_panel.setFixedWidth(310)
         left_panel.setStyleSheet("""
-            QFrame { background-color: white; border-radius: 20px; }
+            QFrame { background-color: white; border-radius: 16px; }
         """)
         shadow_left = QGraphicsDropShadowEffect()
-        shadow_left.setBlurRadius(20)
+        shadow_left.setBlurRadius(15)
         shadow_left.setColor(QColor(0, 0, 0, 15))
-        shadow_left.setOffset(0, 5)
+        shadow_left.setOffset(0, 4)
         left_panel.setGraphicsEffect(shadow_left)
         
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(25, 30, 25, 30)
-        left_layout.setSpacing(20)
+        left_layout.setContentsMargins(16, 16, 16, 16)
+        left_layout.setSpacing(12)
         
         t_label = QLabel('Smart Attendance')
-        t_label.setFont(QFont('Segoe UI', 20, QFont.Bold))
+        t_label.setFont(QFont('Segoe UI', 18, QFont.Bold))
         t_label.setAlignment(Qt.AlignCenter)
-        t_label.setStyleSheet("color: #3B82F6; border: none; margin-bottom: 20px;")
-        
-        # class_label 제거됨
-
+        t_label.setStyleSheet("color: #3B82F6; border: none; margin-bottom: 6px;")
         
         # Hidden QComboBox for backend compatibility
         self.class_combo = QComboBox(self)
@@ -4125,16 +5001,16 @@ class StudentAttendanceApp(QWidget):
         
         # Sleek class selection button replacing the combo box and change button
         self.class_btn = QPushButton('🏫 수업반을 선택하세요')
-        self.class_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
-        self.class_btn.setFixedHeight(55)
+        self.class_btn.setFont(QFont('Malgun Gothic', 12, QFont.Bold))
+        self.class_btn.setFixedHeight(46)
         self.class_btn.setCursor(Qt.PointingHandCursor)
         self.class_btn.setStyleSheet("""
             QPushButton {
                 background-color: #F1F5F9;
                 color: #475569;
                 border: 2px dashed #CBD5E1;
-                border-radius: 15px;
-                padding: 5px 15px;
+                border-radius: 12px;
+                padding: 4px 12px;
                 text-align: center;
             }
             QPushButton:hover {
@@ -4145,12 +5021,9 @@ class StudentAttendanceApp(QWidget):
         """)
         self.class_btn.clicked.connect(self.show_start_class_selector)
         
-        # list_title 제거됨
-
-        
         self.access_list = QListWidget()
-        self.access_list.setFont(QFont('Malgun Gothic', 14, QFont.Bold))
-        self.access_list.setSpacing(5)
+        self.access_list.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
+        self.access_list.setSpacing(4)
         self.access_list.setStyleSheet("""
             QListWidget { 
                 border: none; 
@@ -4174,8 +5047,8 @@ class StudentAttendanceApp(QWidget):
         self.access_list.itemClicked.connect(self.cancel_attendance)
         
         self.end_class_btn = QPushButton('수업 전체 종료')
-        self.end_class_btn.setFont(QFont('Malgun Gothic', 15, QFont.Bold))
-        self.end_class_btn.setFixedHeight(55)
+        self.end_class_btn.setFont(QFont('Malgun Gothic', 14, QFont.Bold))
+        self.end_class_btn.setFixedHeight(48)
         self.end_class_btn.setCursor(Qt.PointingHandCursor)
         self.end_class_btn.setStyleSheet("""
             QPushButton { background-color: #EF4444; color: white; border-radius: 12px; border: none; }
@@ -4184,11 +5057,7 @@ class StudentAttendanceApp(QWidget):
         self.end_class_btn.clicked.connect(self.end_all_class)
         
         left_layout.addWidget(t_label)
-        # left_layout.addWidget(class_label) # 제거됨
-
-        
         left_layout.addWidget(self.class_btn)
-        # left_layout.addWidget(list_title) # 제거됨
         left_layout.addWidget(self.access_list)
         left_layout.addWidget(self.end_class_btn)
         
@@ -4196,34 +5065,53 @@ class StudentAttendanceApp(QWidget):
         # 2. 우측 메인 영역
         # ==========================================
         right_layout = QVBoxLayout()
-        right_layout.setContentsMargins(10, 0, 0, 0)
-        right_layout.setSpacing(25)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
         
-        # 상단 정보표시 표시바 (시계, 교시)
+        # 상단 정보표시 표시바 (시계, 교시, 학생관리, 최소화, 종료)
         header_bar = QHBoxLayout()
         self.period_label = QLabel()
-        self.period_label.setFont(QFont('Malgun Gothic', 15, QFont.Bold))
-        self.period_label.setStyleSheet("color: #059669; background-color: #D1FAE5; padding: 10px 25px; border-radius: 15px;")
+        self.period_label.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
+        self.period_label.setStyleSheet("color: #059669; background-color: #D1FAE5; padding: 6px 18px; border-radius: 12px;")
         self.period_label.hide() 
         
         header_bar.addWidget(self.period_label)
         header_bar.addStretch()
         
+        self.student_mgr_btn = QPushButton('👥 학생 관리')
+        self.student_mgr_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.student_mgr_btn.setFixedHeight(38)
+        self.student_mgr_btn.setCursor(Qt.PointingHandCursor)
+        self.student_mgr_btn.setStyleSheet("""
+            QPushButton { 
+                background-color: #EEF2FF; 
+                color: #4F46E5; 
+                border-radius: 10px; 
+                padding: 0 16px;
+                margin-right: 6px;
+                border: 1.5px solid #C7D2FE;
+            }
+            QPushButton:hover { 
+                background-color: #E0E7FF; 
+            }
+        """)
+        self.student_mgr_btn.clicked.connect(self.open_student_manager)
+
         self.time_label = QLabel()
-        self.time_label.setFont(QFont('Malgun Gothic', 14, QFont.Bold))
-        self.time_label.setStyleSheet("color: #64748B; background-color: white; padding: 10px 25px; border-radius: 15px;")
+        self.time_label.setFont(QFont('Malgun Gothic', 12, QFont.Bold))
+        self.time_label.setStyleSheet("color: #64748B; background-color: white; padding: 6px 18px; border-radius: 12px;")
         
         self.minimize_btn = QPushButton('➖ 최소화')
-        self.minimize_btn.setFont(QFont('Malgun Gothic', 12, QFont.Bold))
-        self.minimize_btn.setFixedHeight(45)
+        self.minimize_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.minimize_btn.setFixedHeight(38)
         self.minimize_btn.setCursor(Qt.PointingHandCursor)
         self.minimize_btn.setStyleSheet("""
             QPushButton { 
                 background-color: #E0F2FE; 
                 color: #0284C7; 
-                border-radius: 12px; 
-                padding: 0 20px;
-                margin-left: 10px;
+                border-radius: 10px; 
+                padding: 0 16px;
+                margin-left: 6px;
                 border: none;
             }
             QPushButton:hover { 
@@ -4233,16 +5121,16 @@ class StudentAttendanceApp(QWidget):
         self.minimize_btn.clicked.connect(self.minimize_app)
         
         self.exit_btn = QPushButton('✖ 종료 (ESC)')
-        self.exit_btn.setFont(QFont('Malgun Gothic', 12, QFont.Bold))
-        self.exit_btn.setFixedHeight(45)
+        self.exit_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.exit_btn.setFixedHeight(38)
         self.exit_btn.setCursor(Qt.PointingHandCursor)
         self.exit_btn.setStyleSheet("""
             QPushButton { 
                 background-color: #FEE2E2; 
                 color: #DC2626; 
-                border-radius: 12px; 
-                padding: 0 20px;
-                margin-left: 10px;
+                border-radius: 10px; 
+                padding: 0 16px;
+                margin-left: 6px;
                 border: none;
             }
             QPushButton:hover { 
@@ -4251,10 +5139,10 @@ class StudentAttendanceApp(QWidget):
         """)
         self.exit_btn.clicked.connect(self.close)
 
+        header_bar.addWidget(self.student_mgr_btn)
         header_bar.addWidget(self.time_label)
         header_bar.addWidget(self.minimize_btn)
         header_bar.addWidget(self.exit_btn)
-
         
         self.update_time()
         self.timer = QTimer(self)
@@ -4263,31 +5151,31 @@ class StudentAttendanceApp(QWidget):
         
         # 중앙 메인 정보 카드
         center_card = QFrame()
-        center_card.setStyleSheet("QFrame { background-color: white; border-radius: 20px; border: 1px solid #E2E8F0; }")
+        center_card.setStyleSheet("QFrame { background-color: white; border-radius: 18px; border: 1px solid #E2E8F0; }")
         shadow_center = QGraphicsDropShadowEffect()
-        shadow_center.setBlurRadius(30)
+        shadow_center.setBlurRadius(20)
         shadow_center.setColor(QColor(0, 0, 0, 15))
-        shadow_center.setOffset(0, 10)
+        shadow_center.setOffset(0, 6)
         center_card.setGraphicsEffect(shadow_center)
         
         cc_layout = QVBoxLayout(center_card)
-        cc_layout.setContentsMargins(30, 30, 30, 30) # 여백 감소 (50 -> 30)
-        cc_layout.setSpacing(10) # 간격 감소 (20 -> 10)
+        cc_layout.setContentsMargins(20, 14, 20, 14)
+        cc_layout.setSpacing(8)
         
-        # 상단 정보 영역 (이모티콘이 나타나도 밀리지 않게 공간을 미리 확보)
+        # 상단 정보 영역
         self.top_info_container = QWidget()
         top_hbox = QHBoxLayout(self.top_info_container)
         top_hbox.setContentsMargins(0, 0, 0, 0)
-        top_hbox.setSpacing(15)
+        top_hbox.setSpacing(12)
         
         self.status = QLabel('학생 번호를 누르세요')
-        self.status.setFont(QFont('Malgun Gothic', 26, QFont.Bold))
+        self.status.setFont(QFont('Malgun Gothic', 22, QFont.Bold))
         self.status.setAlignment(Qt.AlignCenter)
         self.status.setStyleSheet("color: #0F172A; border: none;")
         
         # 큰 감정 아이콘 표시용 레이블
         self.emotion_icon_label = QLabel()
-        self.emotion_icon_label.setFixedSize(120, 120)
+        self.emotion_icon_label.setFixedSize(90, 90)
         self.emotion_icon_label.setAlignment(Qt.AlignCenter)
         self.emotion_icon_label.setStyleSheet("border: none; background: transparent;")
         self.emotion_icon_label.hide()
@@ -4298,29 +5186,28 @@ class StudentAttendanceApp(QWidget):
         top_hbox.addStretch()
         
         cc_layout.addWidget(self.top_info_container)
-        cc_layout.addStretch()
         
         # 프로필 영역
         profile_layout = QHBoxLayout()
-        profile_layout.setSpacing(30)
+        profile_layout.setSpacing(20)
         
         self.photo_label = QLabel()
-        self.photo_label.setFixedSize(220, 280)
+        self.photo_label.setFixedSize(180, 230)
         self.photo_label.setAlignment(Qt.AlignCenter)
-        self.photo_label.setStyleSheet("background-color: #F8FAFC; border: 2px dashed #CBD5E1; border-radius: 20px; color: #94A3B8; font-size: 18px;")
+        self.photo_label.setStyleSheet("background-color: #F8FAFC; border: 2px dashed #CBD5E1; border-radius: 16px; color: #94A3B8; font-size: 16px;")
         
         info_vbox = QVBoxLayout()
-        info_vbox.setSpacing(15)
+        info_vbox.setSpacing(10)
         
         self.detail = QTextEdit('학생 정보를 기다리는 중입니다')
         self.detail.setReadOnly(True)
-        self.detail.setFont(QFont('Malgun Gothic', 16))
+        self.detail.setFont(QFont('Malgun Gothic', 15))
         self.detail.setStyleSheet("color: #64748B; background: transparent; border: none;")
         self.detail.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
         self.history = QLabel('')
-        self.history.setFont(QFont('Malgun Gothic', 15))
-        self.history.setStyleSheet("color: #475569; border: none; padding-top: 15px;")
+        self.history.setFont(QFont('Malgun Gothic', 13))
+        self.history.setStyleSheet("color: #475569; border: none; padding-top: 8px;")
         self.history.hide()
         
         info_vbox.addWidget(self.detail, stretch=1)
@@ -4330,45 +5217,39 @@ class StudentAttendanceApp(QWidget):
         profile_layout.addLayout(info_vbox, stretch=1)
         
         cc_layout.addLayout(profile_layout, stretch=1)
-        cc_layout.addStretch()
         
         # 하단 바코드 입력창
         id_input_layout = QVBoxLayout()
-        lbl = QLabel('STUDENT ID ENTRY')
-        lbl.setFont(QFont('Segoe UI', 13, QFont.Bold))
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet("color: #94A3B8; border: none;")
         
         self.id_input = QLineEdit()
         self.id_input.setEchoMode(QLineEdit.Password)
-        self.id_input.setFont(QFont('Arial', 45, QFont.Bold))
+        self.id_input.setFont(QFont('Arial', 32, QFont.Bold))
         self.id_input.setMaxLength(6)
         self.id_input.setAlignment(Qt.AlignCenter)
-        self.id_input.setFixedSize(450, 90) # 크기 확대
+        self.id_input.setFixedSize(380, 68)
         self.id_input.setStyleSheet("""
             QLineEdit { 
                 background-color: white; 
-                border: 3px solid #94A3B8; 
-                border-radius: 20px; 
+                border: 2.5px solid #94A3B8; 
+                border-radius: 16px; 
                 color: #0F172A; 
             }
             QLineEdit:focus { 
-                border: 3px solid #3B82F6; 
+                border: 2.5px solid #3B82F6; 
                 background-color: #EFF6FF; 
             }
         """)
         self.id_input.returnPressed.connect(self.process_enter)
         
-        self.clear_btn = QPushButton("지우기") # "취소"보다 명확한 "지우기"로 변경 제안 (또는 사용자 요청대로 "취소")
-        self.clear_btn.setText("취소") # 사용자 요청대로 "취소" 유지
-        self.clear_btn.setFont(QFont('Malgun Gothic', 16, QFont.Bold))
-        self.clear_btn.setFixedSize(100, 90)
+        self.clear_btn = QPushButton("취소")
+        self.clear_btn.setFont(QFont('Malgun Gothic', 14, QFont.Bold))
+        self.clear_btn.setFixedSize(85, 68)
         self.clear_btn.setCursor(Qt.PointingHandCursor)
         self.clear_btn.setStyleSheet("""
             QPushButton { 
                 background-color: #F1F5F9; 
                 color: #475569; 
-                border-radius: 20px; 
+                border-radius: 16px; 
                 border: 2px solid #CBD5E1;
             }
             QPushButton:hover { 
@@ -4383,20 +5264,20 @@ class StudentAttendanceApp(QWidget):
         input_hbox.setContentsMargins(0, 0, 0, 0)
         input_hbox.setAlignment(Qt.AlignCenter)
         input_hbox.addWidget(self.id_input)
-        input_hbox.addSpacing(15)
+        input_hbox.addSpacing(12)
         input_hbox.addWidget(self.clear_btn)
 
-        id_input_layout.addLayout(input_hbox) # lbl 추가 부분 제거
+        id_input_layout.addLayout(input_hbox)
         cc_layout.addLayout(id_input_layout)
         
         # 하단 액션 바 (6개 버튼 균등 배치)
         action_bar = QHBoxLayout()
-        action_bar.setSpacing(12)
+        action_bar.setSpacing(8)
         
         self.prev_log_btn = QPushButton('📋 지난 수업 기록')
-        self.prev_log_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
-        self.prev_log_btn.setFixedHeight(65)
-        self.prev_log_btn.setMinimumWidth(120)
+        self.prev_log_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.prev_log_btn.setFixedHeight(50)
+        self.prev_log_btn.setMinimumWidth(100)
         self.prev_log_btn.setCursor(Qt.PointingHandCursor)
         self.prev_log_btn.setToolTip("반을 선택하면 이전 수업 기록을 확인하실 수 있습니다.")
         self.prev_log_btn.setStyleSheet("""
@@ -4404,8 +5285,8 @@ class StudentAttendanceApp(QWidget):
                 background-color: white;
                 color: #64748B;
                 border: 2px dashed #CBD5E1;
-                border-radius: 15px;
-                font-size: 13px;
+                border-radius: 12px;
+                font-size: 11px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -4416,56 +5297,56 @@ class StudentAttendanceApp(QWidget):
         self.prev_log_btn.clicked.connect(self.show_class_log_history)
         
         self.write_log_btn = QPushButton('📝 일지 작성')
-        self.write_log_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
-        self.write_log_btn.setFixedHeight(65)
-        self.write_log_btn.setMinimumWidth(120)
+        self.write_log_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.write_log_btn.setFixedHeight(50)
+        self.write_log_btn.setMinimumWidth(100)
         self.write_log_btn.setCursor(Qt.PointingHandCursor)
         self.write_log_btn.setStyleSheet("""
-            QPushButton { background-color: #8B5CF6; color: white; border-radius: 15px; border: none; }
+            QPushButton { background-color: #8B5CF6; color: white; border-radius: 12px; border: none; font-size: 12px; }
             QPushButton:hover { background-color: #7C3AED; }
         """)
         self.write_log_btn.clicked.connect(self.open_log_dialog)
         
         self.presenter_btn = QPushButton('🎤 발표자 뽑기')
-        self.presenter_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
-        self.presenter_btn.setFixedHeight(65)
-        self.presenter_btn.setMinimumWidth(120)
+        self.presenter_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.presenter_btn.setFixedHeight(50)
+        self.presenter_btn.setMinimumWidth(100)
         self.presenter_btn.setCursor(Qt.PointingHandCursor)
         self.presenter_btn.setStyleSheet("""
-            QPushButton { background-color: #10B981; color: white; border-radius: 15px; border: none; }
+            QPushButton { background-color: #10B981; color: white; border-radius: 12px; border: none; font-size: 12px; }
             QPushButton:hover { background-color: #059669; }
         """)
         self.presenter_btn.clicked.connect(self.open_presenter_dialog)
         
         self.mvp_btn = QPushButton('🌟 오늘의 MVP')
-        self.mvp_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
-        self.mvp_btn.setFixedHeight(65)
-        self.mvp_btn.setMinimumWidth(120)
+        self.mvp_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.mvp_btn.setFixedHeight(50)
+        self.mvp_btn.setMinimumWidth(100)
         self.mvp_btn.setCursor(Qt.PointingHandCursor)
         self.mvp_btn.setStyleSheet("""
-            QPushButton { background-color: #F59E0B; color: white; border-radius: 15px; border: none; }
+            QPushButton { background-color: #F59E0B; color: white; border-radius: 12px; border: none; font-size: 12px; }
             QPushButton:hover { background-color: #D97706; }
         """)
         self.mvp_btn.clicked.connect(self.open_mvp_dialog)
         
         self.overall_btn = QPushButton('🗓️ 출석 현황')
-        self.overall_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
-        self.overall_btn.setFixedHeight(65)
-        self.overall_btn.setMinimumWidth(120)
+        self.overall_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.overall_btn.setFixedHeight(50)
+        self.overall_btn.setMinimumWidth(100)
         self.overall_btn.setCursor(Qt.PointingHandCursor)
         self.overall_btn.setStyleSheet("""
-            QPushButton { background-color: #3B82F6; color: white; border-radius: 15px; border: none; }
+            QPushButton { background-color: #3B82F6; color: white; border-radius: 12px; border: none; font-size: 12px; }
             QPushButton:hover { background-color: #2563EB; }
         """)
         self.overall_btn.clicked.connect(self.show_overall_attendance)
         
         self.mvp_stats_btn = QPushButton('📊 전체 통계')
-        self.mvp_stats_btn.setFont(QFont('Malgun Gothic', 13, QFont.Bold))
-        self.mvp_stats_btn.setFixedHeight(65)
-        self.mvp_stats_btn.setMinimumWidth(120)
+        self.mvp_stats_btn.setFont(QFont('Malgun Gothic', 11, QFont.Bold))
+        self.mvp_stats_btn.setFixedHeight(50)
+        self.mvp_stats_btn.setMinimumWidth(100)
         self.mvp_stats_btn.setCursor(Qt.PointingHandCursor)
         self.mvp_stats_btn.setStyleSheet("""
-            QPushButton { background-color: white; color: #334155; border-radius: 15px; border: 2px solid #E2E8F0; }
+            QPushButton { background-color: white; color: #334155; border-radius: 12px; border: 1.5px solid #E2E8F0; font-size: 12px; }
             QPushButton:hover { background-color: #F8FAFC; }
         """)
         self.mvp_stats_btn.clicked.connect(self.show_mvp_stats)
@@ -5143,12 +6024,14 @@ class StudentAttendanceApp(QWidget):
                 # 일지 내용 렌더링 (리치 텍스트 HTML 지원)
                 is_rich = any(tag in content for tag in ['<!DOCTYPE', '<html', '<body', '<p', '<div', '<img', '<span', '<br'])
                 if is_rich:
-                    body_content = content
-                    if '<body' in content and '</body>' in content:
+                    # 이미지 경로를 현재 실행 디렉토리 기준으로 자동 복원
+                    resolved_content = resolve_image_paths(content, self.base_dir)
+                    body_content = resolved_content
+                    if '<body' in resolved_content and '</body>' in resolved_content:
                         try:
-                            body_content = content.split('<body', 1)[1].split('>', 1)[1].rsplit('</body>', 1)[0].strip()
+                            body_content = resolved_content.split('<body', 1)[1].split('>', 1)[1].rsplit('</body>', 1)[0].strip()
                         except Exception:
-                            body_content = content
+                            body_content = resolved_content
                     items_html = f"""
                     <div style="margin-bottom: 12px; padding: 18px 22px; background-color: #FFFFFF; border: 1.5px solid #E2E8F0; border-radius: 12px; font-size: 14pt; color: #1E293B; line-height: 1.6;">
                         {body_content}
@@ -5193,12 +6076,12 @@ class StudentAttendanceApp(QWidget):
                 """)
             else:
                 empty_html = f"""
-                <div style="font-family: 'Malgun Gothic', sans-serif; text-align: center; padding-top: 50px;">
-                    <div style="font-size: 38pt; margin-bottom: 15px;">📝</div>
-                    <div style="font-size: 22pt; font-weight: bold; color: #475569; margin-bottom: 12px;">
+                <div style="font-family: 'Malgun Gothic', sans-serif; text-align: center; padding-top: 15px;">
+                    <div style="font-size: 26pt; margin-bottom: 8px;">📝</div>
+                    <div style="font-size: 16pt; font-weight: bold; color: #475569; margin-bottom: 8px;">
                         [{html.escape(class_name)}] 등록된 수업 일지가 없습니다.
                     </div>
-                    <div style="font-size: 16pt; color: #94A3B8;">
+                    <div style="font-size: 13pt; color: #94A3B8;">
                         하단의 <b>[📝 일지 작성]</b> 버튼을 눌러 지난 수업 내용이나 오늘 진도를 기록해 보세요.
                     </div>
                 </div>
@@ -5208,8 +6091,8 @@ class StudentAttendanceApp(QWidget):
                     QTextEdit {
                         background-color: #F8FAFC;
                         border: 2px dashed #CBD5E1;
-                        border-radius: 20px;
-                        padding: 30px;
+                        border-radius: 16px;
+                        padding: 15px;
                     }
                 """)
                 
@@ -5220,6 +6103,31 @@ class StudentAttendanceApp(QWidget):
                 self.emotion_icon_label.hide()
         else:
             self.reset_screen()
+
+    def open_student_manager(self):
+        dlg = StudentManagementDialog(self)
+        dlg.exec_()
+
+    def save_students_data(self):
+        # Save back to self.csv_path
+        if not self.students_data:
+            return
+        fieldnames = ['학년반번호', '이름', '학생정보', '사진파일명']
+        try:
+            with open(self.csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                for s_id, data in sorted(self.students_data.items()):
+                    # 키 이름 일치화
+                    row = {
+                        '학년반번호': s_id,
+                        '이름': data.get('이름', ''),
+                        '학생정보': data.get('학생정보', data.get('학년반', '')),
+                        '사진파일명': data.get('사진파일명', '')
+                    }
+                    writer.writerow(row)
+        except Exception as e:
+            print("Error saving students data:", e)
 
 if __name__ == '__main__':
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
